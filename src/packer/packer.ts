@@ -45,7 +45,12 @@ function emptyMask(w: number, h: number): Mask {
 }
 
 interface Variant {
-  bitmap: ImageBitmap;
+  /**
+   * Cropped rotated bitmap. Lives on the lead worker only \u2014 helper
+   * workers that receive deserialized variants set this to null, since
+   * only masks are needed for collision and stamping.
+   */
+  bitmap: ImageBitmap | null;
   width: number; // canvas px
   height: number; // canvas px
   mask: Mask;
@@ -149,6 +154,12 @@ class Occupancy {
   /** Integral image of `data` (unpacked sums), size (w+1)*(h+1). */
   private integral: Int32Array;
   /**
+   * Scratch buffer used by `probeCollision` to hold the bitpacked
+   * `col_set` of a colliding mask row (columns in mask-local coords where
+   * the mask overlaps occupied cells). Grown on demand.
+   */
+  private scratch: Uint32Array;
+  /**
    * Smallest row index that has been modified since the last integral
    * rebuild. `ensureIntegral` then only rebuilds [dirtyMinY, h). Rows
    * above dirtyMinY are unchanged, and their cumulative row-ends in the
@@ -163,6 +174,7 @@ class Occupancy {
     this.rowWords = ((w + 31) >>> 5) + 1;
     this.data = new Uint32Array(this.rowWords * h);
     this.integral = new Int32Array((w + 1) * (h + 1));
+    this.scratch = new Uint32Array(16);
     this.dirtyMinY = 0;
   }
 
@@ -198,35 +210,76 @@ class Occupancy {
     );
   }
 
-  collidesPixel(m: Mask, px: number, py: number): boolean {
+  /**
+   * Probe whether the mask collides at (px, py) and, if so, return a sound
+   * forward skip distance k >= 1 such that every px' in (px, px+k) is
+   * guaranteed to also collide. Returns 0 when the mask does NOT collide
+   * (position is free).
+   *
+   * Skip derivation
+   * ---------------
+   * Walk mask rows until one has a non-zero collision bitmap
+   * `col_set = mask_row(my) AND occ_window(py+my, px)` (the mask-local
+   * columns where the mask touches occupied cells). The same occ cells
+   * remain occupied at any px' > px, so for px' = px+k the occ cell that
+   * was struck by mask col `s` is now under mask col `s-k`. Thus px+k
+   * still collides iff `(mask_row << k) & col_set != 0` (bit s-k of the
+   * original mask_row mapped to bit s via a left shift of k). The
+   * smallest k >= 1 for which that AND is zero is the first px' we
+   * can't prove collides — a sound skip. Upper bound k <= mw (when the
+   * shifted mask has no bits at positions <= max(col_set)).
+   *
+   * Multi-row skip
+   * --------------
+   * Position px+k is proven to collide iff AT LEAST ONE of the probed
+   * rows still collides at k. Per-row skip d_i is the smallest k where
+   * row i stops colliding. So the overall sound skip is `max_i d_i`:
+   * for any k < max d_i, some row (the one with d_i > k) is still
+   * colliding, hence px+k is guaranteed to collide. At k = max d_i,
+   * no row provably still collides, so it's the first position we must
+   * re-probe. Strictly tighter than the single-row skip.
+   */
+  probeCollision(m: Mask, px: number, py: number): number {
     const occ = this.data;
     const oRW = this.rowWords;
     const mRW = m.rowWords;
     const md = m.data;
+    const mw = m.w;
     const shift = px & 31;
     const wordOff = px >>> 5;
-    if (shift === 0) {
-      for (let y = 0; y < m.h; y++) {
-        const mBase = y * mRW;
-        const oBase = (py + y) * oRW + wordOff;
+    if (this.scratch.length < mRW) this.scratch = new Uint32Array(mRW);
+    const colSet = this.scratch;
+    const inv = 32 - shift;
+    let maxSkip = 0;
+
+    for (let y = 0; y < m.h; y++) {
+      const mBase = y * mRW;
+      const oBase = (py + y) * oRW + wordOff;
+      let any = 0;
+      if (shift === 0) {
         for (let i = 0; i < mRW; i++) {
-          if ((md[mBase + i] & occ[oBase + i]) !== 0) return true;
+          const c = md[mBase + i] & occ[oBase + i];
+          colSet[i] = c;
+          any |= c;
+        }
+      } else {
+        for (let i = 0; i < mRW; i++) {
+          const mwWord = md[mBase + i];
+          let c = 0;
+          if (mwWord !== 0) {
+            const win =
+              (occ[oBase + i] >>> shift) | (occ[oBase + i + 1] << inv);
+            c = mwWord & win;
+          }
+          colSet[i] = c;
+          any |= c;
         }
       }
-    } else {
-      const inv = 32 - shift;
-      for (let y = 0; y < m.h; y++) {
-        const mBase = y * mRW;
-        const oBase = (py + y) * oRW + wordOff;
-        for (let i = 0; i < mRW; i++) {
-          const mw = md[mBase + i];
-          if (mw === 0) continue;
-          const win = (occ[oBase + i] >>> shift) | (occ[oBase + i + 1] << inv);
-          if ((mw & win) !== 0) return true;
-        }
-      }
+      if (any === 0) continue;
+      const rowSkip = skipForCollision(md, mBase, colSet, mRW, mw);
+      if (rowSkip > maxSkip) maxSkip = rowSkip;
     }
-    return false;
+    return maxSkip;
   }
 
   stamp(m: Mask, px: number, py: number) {
@@ -489,7 +542,9 @@ export async function pack(
       if (!dup) uniq.push(v);
     }
     stickerVariants.set(s.id, uniq);
-    variantBitmaps[s.id] = uniq.map((v) => v.bitmap);
+    // Bitmaps are always set in the variant-building path (only helper-
+    // worker deserialization nulls them), so the cast is safe.
+    variantBitmaps[s.id] = uniq.map((v) => v.bitmap as ImageBitmap);
   }
 
   // Hand the bitmaps to the caller up-front. The worker transfers them
@@ -796,6 +851,49 @@ function buildRotationList(stepDeg: number): number[] {
   return list;
 }
 
+/**
+ * Smallest k >= 1 with `(mask_row << k) & colSet == 0` across all words.
+ * Both inputs are bitpacked rows of `rw` 32-bit words; `mw` is the mask's
+ * cell width and bounds the search (k in 1..mw suffices, see proof in
+ * Occupancy.probeCollision).
+ */
+function skipForCollision(
+  mask: Uint32Array,
+  mBase: number,
+  colSet: Uint32Array,
+  rw: number,
+  mw: number,
+): number {
+  for (let k = 1; k <= mw; k++) {
+    const ws = k >>> 5;
+    const bs = k & 31;
+    let hit = false;
+    if (bs === 0) {
+      for (let i = 0; i < rw; i++) {
+        const src = i - ws >= 0 ? mask[mBase + i - ws] : 0;
+        if ((src & colSet[i]) !== 0) {
+          hit = true;
+          break;
+        }
+      }
+    } else {
+      const invBs = 32 - bs;
+      for (let i = 0; i < rw; i++) {
+        const a = i - ws >= 0 ? mask[mBase + i - ws] : 0;
+        const b = i - ws - 1 >= 0 ? mask[mBase + i - ws - 1] : 0;
+        const shifted = ((a << bs) | (b >>> invBs)) >>> 0;
+        if ((shifted & colSet[i]) !== 0) {
+          hit = true;
+          break;
+        }
+      }
+    }
+    if (!hit) return k;
+  }
+  // Unreachable given the upper bound — returning mw+1 is still sound.
+  return mw + 1;
+}
+
 function maskEquals(a: Mask, b: Mask): boolean {
   if (a.w !== b.w || a.h !== b.h) return false;
   const ad = a.data;
@@ -807,7 +905,19 @@ function maskEquals(a: Mask, b: Mask): boolean {
 
 /**
  * Scan top-left → bottom-right across all variants and return the first fit.
- * Integral image lets us skip almost every empty region in O(1).
+ *
+ * Inner loop optimisations
+ * ------------------------
+ * 1. Integral-image O(1) reject: if the dilated-bbox region has zero
+ *    occupancy the variant trivially fits — accept immediately.
+ * 2. Sound skip-forward: on collision, `probeCollision` returns a skip
+ *    k >= 1 such that every x' in (x, x+k) is proven to also collide for
+ *    that variant. Across variants tried at the same (x, y) we take the
+ *    minimum skip, which is still sound (positions we jump over collide
+ *    with *every* variant we tested). `minSkipEligible` bumps the skip
+ *    up to the first x where the smallest variant is in-bounds — skipped
+ *    positions were already out-of-bounds for every variant.
+ * 3. Variant order cached once, not per-call.
  */
 function findPlacement(
   occ: Occupancy,
@@ -823,21 +933,432 @@ function findPlacement(
         variants[b].dilated.w * variants[b].dilated.h -
         variants[a].dilated.w * variants[a].dilated.h,
     );
+  // Smallest dilated width across variants — used to break out of the
+  // row loop once x is too close to the right edge for *any* variant.
+  let minMW = Infinity;
+  for (const v of variants) {
+    if (v.dilated.w < minMW) minMW = v.dilated.w;
+  }
   for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
+    let x = 0;
+    while (x + minMW <= W) {
+      let minSkip = Infinity;
       for (const vi of order) {
         const v = variants[vi];
         const mw = v.dilated.w;
         const mh = v.dilated.h;
         if (x + mw > W || y + mh > H) continue;
-        // Fast reject: if the mask bbox has ANY occupancy, fall back to pixel test.
-        // If the bbox is completely empty, the dilated mask trivially fits.
         const sum = occ.regionSum(x, y, mw, mh);
         if (sum === 0) return { x, y, vIdx: vi };
-        // Partial overlap: might still fit around existing shapes.
-        if (!occ.collidesPixel(v.dilated, x, y)) return { x, y, vIdx: vi };
+        const skip = occ.probeCollision(v.dilated, x, y);
+        if (skip === 0) return { x, y, vIdx: vi };
+        if (skip < minSkip) minSkip = skip;
       }
+      // If no variant was in-bounds, minSkip stays Infinity; the while
+      // guard (`x + minMW <= W`) guarantees at least the smallest variant
+      // fits, so `minSkip` is always finite here.
+      x += minSkip === Infinity ? 1 : minSkip;
     }
   }
   return null;
+}
+
+// ======================================================================
+// Parallel-execution primitives
+// ----------------------------------------------------------------------
+// `pack()` above still works end-to-end in a single worker. The exports
+// below let a *coordinator* worker fan out attempts across a pool of
+// helper workers:
+//
+//   1. Coordinator calls `buildPackContext(req)` \u2014 produces the full
+//      per-sticker variant set and the padding/grid config exactly once.
+//   2. Coordinator calls `serializePackContext(ctx)` \u2014 produces a
+//      structured-cloneable payload (mask buffers + metadata). Helpers
+//      receive it via `postMessage` and rebuild their own `PackContext`
+//      via `deserializePackContext`.
+//   3. Each helper repeatedly receives an `order: string[]` and calls
+//      `runAttemptInContext(ctx, order)` returning `{ result, occBuffer }`.
+//      `occBuffer` is the bitpacked occupancy bytes; transferable.
+//   4. Coordinator picks the best result; for the winner it reconstructs
+//      an `Occupancy` from `occBuffer` via `occupancyFromBuffer` and calls
+//      `probeExtraFitsInContext` to compute the "you could fit more"
+//      numbers.
+// ======================================================================
+
+/**
+ * Structured-cloneable snapshot of a single `Variant`. The mask buffers
+ * are plain `ArrayBuffer`s so they can be cloned into each helper. We
+ * never transfer (which would detach and break the coordinator's copy);
+ * the JS structured-clone cost for a few MB is negligible next to the
+ * packing work itself.
+ */
+export interface SerializedVariant {
+  // `ArrayBufferLike` covers both `ArrayBuffer` and `SharedArrayBuffer`;
+  // that's what `Uint32Array.prototype.buffer` returns under recent TS
+  // lib definitions.
+  maskBuf: ArrayBufferLike;
+  maskW: number;
+  maskH: number;
+  maskRowWords: number;
+  dilatedBuf: ArrayBufferLike;
+  dilatedW: number;
+  dilatedH: number;
+  dilatedRowWords: number;
+  dilatedOffsetX: number;
+  dilatedOffsetY: number;
+  width: number;
+  height: number;
+  rotationDeg: number;
+}
+
+export interface SerializedPackContext {
+  stickerIds: string[];
+  stickersVariants: Record<string, SerializedVariant[]>;
+  stickersQty: Record<string, number>;
+  stride: number;
+  gridW: number;
+  gridH: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  padCellsL: number;
+  padCellsR: number;
+  padCellsT: number;
+  padCellsB: number;
+  totalRequested: number;
+}
+
+/**
+ * Runtime form of a pack context. Held by both coordinator and helpers.
+ * Carries everything `runAttemptInContext` needs \u2014 variants, quantities,
+ * padding \u2014 so an attempt is a pure function of `(ctx, order)`.
+ */
+export interface PackContext {
+  stickerIds: string[];
+  stickersVariants: Map<string, Variant[]>;
+  stickersQty: Map<string, number>;
+  stride: number;
+  gridW: number;
+  gridH: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  padCellsL: number;
+  padCellsR: number;
+  padCellsT: number;
+  padCellsB: number;
+  totalRequested: number;
+  /** Blocks the padding bands on a freshly-constructed occupancy grid. */
+  applyPadding: (occ: Occupancy) => void;
+}
+
+/**
+ * Serializable result of one attempt. Same shape as the internal
+ * `AttemptResult` minus the `Occupancy` object \u2014 that flies back as a
+ * transferable `ArrayBuffer` via `AttemptEnvelope.occBuffer` instead.
+ */
+export interface AttemptSnapshot {
+  placements: Placement[];
+  perSticker: Record<string, { requested: number; placed: number }>;
+  placedCount: number;
+  bboxArea: number;
+}
+
+export interface AttemptEnvelope {
+  result: AttemptSnapshot;
+  occBuffer: ArrayBufferLike;
+}
+
+/**
+ * Build variants + grid/padding config. Mirrors the upfront section of
+ * `pack()` but returns a reusable `PackContext` and the sticker bitmaps
+ * (which the coordinator will transfer to the main thread once).
+ */
+export async function buildPackContext(
+  req: SerializablePackRequest,
+): Promise<{
+  ctx: PackContext;
+  variantBitmaps: Record<string, ImageBitmap[]>;
+}> {
+  const stride = Math.max(1, Math.floor(req.stride));
+  const gridW = Math.max(1, Math.floor(req.canvasWidth / stride));
+  const gridH = Math.max(1, Math.floor(req.canvasHeight / stride));
+  const marginCells = Math.max(0, Math.round(req.margin / stride));
+  const pad = req.padding;
+  const padCellsL = pad ? Math.max(0, Math.round(pad.left / stride)) : 0;
+  const padCellsR = pad ? Math.max(0, Math.round(pad.right / stride)) : 0;
+  const padCellsT = pad ? Math.max(0, Math.round(pad.top / stride)) : 0;
+  const padCellsB = pad ? Math.max(0, Math.round(pad.bottom / stride)) : 0;
+  const applyPadding = (occ: Occupancy) => {
+    if (padCellsL > 0) occ.blockRect(0, 0, padCellsL, gridH);
+    if (padCellsR > 0) occ.blockRect(gridW - padCellsR, 0, padCellsR, gridH);
+    if (padCellsT > 0) occ.blockRect(0, 0, gridW, padCellsT);
+    if (padCellsB > 0) occ.blockRect(0, gridH - padCellsB, gridW, padCellsB);
+  };
+
+  const step = Math.max(0, req.rotationStepDeg);
+  const rotations: number[] = step <= 0 ? [0] : buildRotationList(step);
+
+  const stickersVariants = new Map<string, Variant[]>();
+  const variantBitmaps: Record<string, ImageBitmap[]> = {};
+  for (const s of req.stickers) {
+    const list: Variant[] = [];
+    for (const r of rotations) {
+      const v = await buildVariant(
+        s.bitmap,
+        r,
+        req.alphaThreshold,
+        stride,
+        marginCells,
+      );
+      if (v) list.push(v);
+    }
+    const uniq: Variant[] = [];
+    for (const v of list) {
+      const dup = uniq.find(
+        (u) =>
+          u.mask.w === v.mask.w &&
+          u.mask.h === v.mask.h &&
+          maskEquals(u.mask, v.mask),
+      );
+      if (!dup) uniq.push(v);
+    }
+    stickersVariants.set(s.id, uniq);
+    variantBitmaps[s.id] = uniq.map((v) => v.bitmap as ImageBitmap);
+  }
+
+  const stickerIds = req.stickers.map((s) => s.id);
+  const stickersQty = new Map<string, number>();
+  let totalRequested = 0;
+  for (const s of req.stickers) {
+    stickersQty.set(s.id, s.quantity);
+    totalRequested += s.quantity;
+  }
+
+  const ctx: PackContext = {
+    stickerIds,
+    stickersVariants,
+    stickersQty,
+    stride,
+    gridW,
+    gridH,
+    canvasWidth: req.canvasWidth,
+    canvasHeight: req.canvasHeight,
+    padCellsL,
+    padCellsR,
+    padCellsT,
+    padCellsB,
+    totalRequested,
+    applyPadding,
+  };
+  return { ctx, variantBitmaps };
+}
+
+/** Coordinator-side \u2014 clones the mask buffers for transport to helpers. */
+export function serializePackContext(ctx: PackContext): SerializedPackContext {
+  const stickersVariants: Record<string, SerializedVariant[]> = {};
+  for (const id of ctx.stickerIds) {
+    const variants = ctx.stickersVariants.get(id) ?? [];
+    stickersVariants[id] = variants.map((v) => ({
+      // `.slice(0)` gives each helper its own detached copy \u2014 lets the
+      // structured clone proceed without transferring (which would
+      // detach the coordinator's copy and break subsequent helpers).
+      maskBuf: v.mask.data.buffer.slice(0),
+      maskW: v.mask.w,
+      maskH: v.mask.h,
+      maskRowWords: v.mask.rowWords,
+      dilatedBuf: v.dilated.data.buffer.slice(0),
+      dilatedW: v.dilated.w,
+      dilatedH: v.dilated.h,
+      dilatedRowWords: v.dilated.rowWords,
+      dilatedOffsetX: v.dilatedOffsetX,
+      dilatedOffsetY: v.dilatedOffsetY,
+      width: v.width,
+      height: v.height,
+      rotationDeg: v.rotationDeg,
+    }));
+  }
+  const stickersQty: Record<string, number> = {};
+  for (const [k, v] of ctx.stickersQty) stickersQty[k] = v;
+  return {
+    stickerIds: [...ctx.stickerIds],
+    stickersVariants,
+    stickersQty,
+    stride: ctx.stride,
+    gridW: ctx.gridW,
+    gridH: ctx.gridH,
+    canvasWidth: ctx.canvasWidth,
+    canvasHeight: ctx.canvasHeight,
+    padCellsL: ctx.padCellsL,
+    padCellsR: ctx.padCellsR,
+    padCellsT: ctx.padCellsT,
+    padCellsB: ctx.padCellsB,
+    totalRequested: ctx.totalRequested,
+  };
+}
+
+/** Helper-side \u2014 rebuild runtime `PackContext` from the cloned payload. */
+export function deserializePackContext(s: SerializedPackContext): PackContext {
+  const stickersVariants = new Map<string, Variant[]>();
+  for (const id of s.stickerIds) {
+    const variants: Variant[] = (s.stickersVariants[id] ?? []).map((sv) => ({
+      bitmap: null,
+      width: sv.width,
+      height: sv.height,
+      mask: {
+        data: new Uint32Array(sv.maskBuf),
+        w: sv.maskW,
+        h: sv.maskH,
+        rowWords: sv.maskRowWords,
+      },
+      dilated: {
+        data: new Uint32Array(sv.dilatedBuf),
+        w: sv.dilatedW,
+        h: sv.dilatedH,
+        rowWords: sv.dilatedRowWords,
+      },
+      dilatedOffsetX: sv.dilatedOffsetX,
+      dilatedOffsetY: sv.dilatedOffsetY,
+      rotationDeg: sv.rotationDeg,
+    }));
+    stickersVariants.set(id, variants);
+  }
+  const stickersQty = new Map<string, number>();
+  for (const [k, v] of Object.entries(s.stickersQty)) stickersQty.set(k, v);
+  const {
+    gridW,
+    gridH,
+    padCellsL,
+    padCellsR,
+    padCellsT,
+    padCellsB,
+  } = s;
+  const applyPadding = (occ: Occupancy) => {
+    if (padCellsL > 0) occ.blockRect(0, 0, padCellsL, gridH);
+    if (padCellsR > 0) occ.blockRect(gridW - padCellsR, 0, padCellsR, gridH);
+    if (padCellsT > 0) occ.blockRect(0, 0, gridW, padCellsT);
+    if (padCellsB > 0) occ.blockRect(0, gridH - padCellsB, gridW, padCellsB);
+  };
+  return {
+    stickerIds: s.stickerIds,
+    stickersVariants,
+    stickersQty,
+    stride: s.stride,
+    gridW,
+    gridH,
+    canvasWidth: s.canvasWidth,
+    canvasHeight: s.canvasHeight,
+    padCellsL,
+    padCellsR,
+    padCellsT,
+    padCellsB,
+    totalRequested: s.totalRequested,
+    applyPadding,
+  };
+}
+
+/**
+ * Run one greedy attempt and return a transferable result + occ buffer.
+ * Pure w.r.t. the context \u2014 each call allocates its own `Occupancy`, so
+ * helpers can reuse the same context across many attempts safely.
+ */
+export function runAttemptInContext(
+  ctx: PackContext,
+  order: string[],
+): AttemptEnvelope {
+  const occ = new Occupancy(ctx.gridW, ctx.gridH);
+  ctx.applyPadding(occ);
+  const remaining = new Map<string, number>();
+  const perSticker: Record<string, { requested: number; placed: number }> = {};
+  for (const id of ctx.stickerIds) {
+    const q = ctx.stickersQty.get(id) ?? 0;
+    remaining.set(id, q);
+    perSticker[id] = { requested: q, placed: 0 };
+  }
+  const placements: Placement[] = [];
+  const exhausted = new Set<string>();
+  let placedCount = 0;
+  let bboxArea = 0;
+
+  let madeProgress = true;
+  while (madeProgress) {
+    madeProgress = false;
+    for (const id of order) {
+      const left = remaining.get(id) ?? 0;
+      if (left <= 0) continue;
+      if (exhausted.has(id)) continue;
+      const variants = ctx.stickersVariants.get(id);
+      if (!variants || variants.length === 0) {
+        exhausted.add(id);
+        continue;
+      }
+      occ.ensureIntegral();
+      const hit = findPlacement(occ, variants);
+      if (!hit) {
+        exhausted.add(id);
+        continue;
+      }
+      const v = variants[hit.vIdx];
+      const stampX = hit.x - v.dilatedOffsetX;
+      const stampY = hit.y - v.dilatedOffsetY;
+      occ.stamp(v.mask, stampX, stampY);
+      placements.push({
+        stickerId: id,
+        x: stampX * ctx.stride,
+        y: stampY * ctx.stride,
+        rotation: v.rotationDeg,
+        width: v.width,
+        height: v.height,
+        variantIdx: hit.vIdx,
+      });
+      remaining.set(id, left - 1);
+      perSticker[id].placed++;
+      placedCount++;
+      bboxArea += v.width * v.height;
+      madeProgress = true;
+    }
+  }
+
+  return {
+    result: { placements, perSticker, placedCount, bboxArea },
+    // Hand off the underlying buffer. The local `occ` goes out of scope
+    // immediately after, so losing `data.buffer` is fine.
+    occBuffer: occ.data.buffer,
+  };
+}
+
+/**
+ * Coordinator-side \u2014 rebuild an `Occupancy` from the bitpacked bytes of a
+ * completed attempt so `probeExtraFitsInContext` can run on it.
+ */
+export function occupancyFromBuffer(
+  w: number,
+  h: number,
+  buffer: ArrayBufferLike,
+): Occupancy {
+  const occ = new Occupancy(w, h);
+  const incoming = new Uint32Array(buffer);
+  // `Uint32Array.set` copies; dirtyMinY stays 0 so the integral image
+  // will rebuild on first access \u2014 which is exactly what we want.
+  occ.data.set(incoming);
+  return occ;
+}
+
+/**
+ * Coordinator-side finalize pass on the winning attempt. Equivalent to
+ * the in-line `probeExtraFits(best.occ, ids, stickerVariants)` call that
+ * the monolithic `pack()` does, but usable from outside this module.
+ */
+export function probeExtraFitsInContext(
+  occ: Occupancy,
+  ctx: PackContext,
+): Record<string, number> {
+  return probeExtraFits(occ, ctx.stickerIds, ctx.stickersVariants);
+}
+
+/**
+ * Deterministic seeded shuffle for orderings \u2014 exposed so the
+ * coordinator can generate the same ordering distribution as monolithic
+ * `pack()` when it fans attempts out to helpers.
+ */
+export function shuffledIds(ids: string[], seed: number): string[] {
+  return shuffled(ids, seed);
 }
