@@ -73,7 +73,7 @@ interface PackState {
 const DEFAULT_DPI = 300;
 const DEFAULT_MARGIN_MM = 2;
 const DEFAULT_ALPHA = 16;
-const DEFAULT_CANVAS_PAD_MM = 0;
+const DEFAULT_CANVAS_PAD_MM = 3;
 const MAX_CANVAS_PAD_MM = 50;
 
 interface CanvasPaddingMm {
@@ -389,6 +389,10 @@ export default function App() {
               progressRequested: msg.snapshot.requested,
             }));
           } else if (msg.type === "done") {
+            // `done` carries the final layout but `extraFits` is left
+            // empty by the worker — the probe runs afterwards and
+            // arrives in a follow-up `extraFits` message. Keep the
+            // handler registered so we catch it.
             setPack((p) => ({
               ...p,
               loading: false,
@@ -397,6 +401,17 @@ export default function App() {
               result: msg.result,
               error: null,
             }));
+          } else if (msg.type === "extraFits") {
+            // Follow-up after `done`. Merge the numbers into whatever
+            // result is currently on the pack state — guarded so a
+            // superseded request can't clobber a newer result.
+            setPack((p) => {
+              if (!p.result) return p;
+              return {
+                ...p,
+                result: { ...p.result, extraFits: msg.extraFits },
+              };
+            });
             worker.removeEventListener("message", handler);
           } else if (msg.type === "error") {
             setPack((p) => ({ ...p, loading: false, error: msg.message }));

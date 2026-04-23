@@ -106,6 +106,19 @@ export interface DoneMessage {
   result: PackResult;
 }
 
+/**
+ * Follow-up message emitted AFTER `done`. Carries the "you could fit
+ * more" numbers computed by probing the winning attempt's leftover
+ * space. Decoupled from `done` because the probe can take a while on a
+ * mostly-empty canvas with tiny stickers (round-robin greedy placement
+ * up to a cap), and blocking the main `done` on it was making the UI
+ * feel unresponsive even after a full pack was found.
+ */
+export interface ExtraFitsMessage {
+  type: "extraFits";
+  extraFits: Record<string, number>;
+}
+
 export interface ErrorMessage {
   type: "error";
   message: string;
@@ -116,6 +129,7 @@ export type WorkerOutMessage =
   | VariantsMessage
   | PartialMessage
   | DoneMessage
+  | ExtraFitsMessage
   | ErrorMessage;
 
 export interface WorkerInMessage {

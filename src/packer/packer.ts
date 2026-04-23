@@ -693,28 +693,52 @@ export async function pack(
   };
 }
 
+export interface ProbeExtraFitsOptions {
+  /**
+   * Hard cap on total extra placements across all stickers. Prevents
+   * the probe from running forever on a mostly-empty canvas with tiny
+   * stickers. Default keeps backward-compat with the old behaviour.
+   */
+  hardCap?: number;
+  /**
+   * Wall-clock cap (ms). The probe checks `performance.now()` every
+   * round-robin iteration and bails when exceeded. 0 disables. Default
+   * is 500ms — enough to return a useful number for "suggest more copies"
+   * in the common case, short enough that the user never notices it.
+   */
+  budgetMs?: number;
+}
+
 /**
  * Probe how many more copies of each sticker would fit into the leftover
  * space. MUTATES `occ` (fine — we're done with it). Iteration is round-
  * robin over ids so fairness between stickers is maintained, matching the
  * UI intent of "here's a balanced way to use up the remaining area".
+ *
+ * Bounded by two knobs (see `ProbeExtraFitsOptions`): a hard placement
+ * cap, and a wall-clock budget. Either one terminates the probe early.
+ * On early termination the returned numbers are a *lower bound* — more
+ * copies might still fit, but we stopped looking.
  */
 function probeExtraFits(
   occ: Occupancy,
   ids: string[],
   stickerVariants: Map<string, Variant[]>,
+  opts: ProbeExtraFitsOptions = {},
 ): Record<string, number> {
+  const hardCap = opts.hardCap ?? 2000;
+  const budgetMs = opts.budgetMs ?? 500;
+  const deadline = budgetMs > 0 ? performance.now() + budgetMs : Infinity;
   const extras: Record<string, number> = {};
   for (const id of ids) extras[id] = 0;
   const exhausted = new Set<string>();
-  // Safety cap in case of pathological inputs (tiny stickers + huge canvas).
-  const HARD_CAP = 2000;
   let produced = 0;
   let madeProgress = true;
-  while (madeProgress && produced < HARD_CAP) {
+  while (madeProgress && produced < hardCap) {
     madeProgress = false;
     for (const id of ids) {
       if (exhausted.has(id)) continue;
+      if (performance.now() >= deadline) return extras;
       const variants = stickerVariants.get(id);
       if (!variants || variants.length === 0) {
         exhausted.add(id);
@@ -731,7 +755,7 @@ function probeExtraFits(
       extras[id]++;
       produced++;
       madeProgress = true;
-      if (produced >= HARD_CAP) break;
+      if (produced >= hardCap) break;
     }
   }
   return extras;
@@ -1350,8 +1374,9 @@ export function occupancyFromBuffer(
 export function probeExtraFitsInContext(
   occ: Occupancy,
   ctx: PackContext,
+  opts?: ProbeExtraFitsOptions,
 ): Record<string, number> {
-  return probeExtraFits(occ, ctx.stickerIds, ctx.stickersVariants);
+  return probeExtraFits(occ, ctx.stickerIds, ctx.stickersVariants, opts);
 }
 
 /**
