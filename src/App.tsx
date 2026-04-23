@@ -106,7 +106,7 @@ export default function App() {
   });
   const [canvasPadLinked, setCanvasPadLinked] = useState(true);
   const [alpha, setAlpha] = useState(DEFAULT_ALPHA);
-  const [stride, setStride] = useState(1);
+  const [stride, setStride] = useState(2);
   const [rotationStep, setRotationStep] = useState(15);
   const [galleryOpen, setGalleryOpen] = useState(false);
   const [importing, setImporting] = useState(false);

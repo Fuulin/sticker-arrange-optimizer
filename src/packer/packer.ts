@@ -27,10 +27,21 @@ import type {
  *      nothing — i.e. when no sticker fits at any angle at any position.
  */
 
+/**
+ * Binary mask, bitpacked row-major. Each row is `rowWords` 32-bit words
+ * (32 cells per word, bit 0 = column 0). Bits beyond column w in the last
+ * word are always 0. Packing gives ~32x fewer ops for collision/stamp.
+ */
 interface Mask {
-  data: Uint8Array;
+  data: Uint32Array;
   w: number;
   h: number;
+  rowWords: number;
+}
+
+function emptyMask(w: number, h: number): Mask {
+  const rowWords = Math.max(1, (w + 31) >>> 5);
+  return { data: new Uint32Array(rowWords * h), w, h, rowWords };
 }
 
 interface Variant {
@@ -52,40 +63,75 @@ function extractMask(
   h: number,
   alphaThreshold: number,
 ): Mask {
-  const img = ctx.getImageData(0, 0, w, h);
-  const data = new Uint8Array(w * h);
-  for (let i = 0, p = 3; i < w * h; i++, p += 4) {
-    if (img.data[p] >= alphaThreshold) data[i] = 1;
+  const img = ctx.getImageData(0, 0, w, h).data;
+  const m = emptyMask(w, h);
+  const rw = m.rowWords;
+  const md = m.data;
+  let p = 3;
+  for (let y = 0; y < h; y++) {
+    const base = y * rw;
+    for (let x = 0; x < w; x++, p += 4) {
+      if (img[p] >= alphaThreshold) md[base + (x >>> 5)] |= 1 << (x & 31);
+    }
   }
-  return { data, w, h };
+  return m;
 }
 
-/** Chebyshev dilation by r cells, padded by r on every side. */
+/**
+ * Chebyshev dilation by r cells, padded by r on every side. Two passes
+ * (horizontal then vertical), both bitwise on the packed row words. The
+ * horizontal pass ORs the source row into the destination at each of the
+ * 2r+1 offsets 0..2r (cell-index shift = word shift + bit shift with carry).
+ * The vertical pass ORs each horizontally-dilated row into rows [y, y+2r].
+ */
 function dilate(mask: Mask, r: number): { mask: Mask; pad: number } {
   if (r <= 0) return { mask, pad: 0 };
-  const { w, h, data } = mask;
-  const ow = w + 2 * r;
-  const oh = h + 2 * r;
-  const tmp = new Uint8Array(ow * h);
-  for (let y = 0; y < h; y++) {
-    const src = y * w;
-    const dst = y * ow;
-    for (let x = 0; x < w; x++) {
-      if (data[src + x]) {
-        const start = dst + x;
-        for (let k = 0; k <= 2 * r; k++) tmp[start + k] = 1;
+  const w1 = mask.w + 2 * r;
+  const h1 = mask.h;
+  const horiz = emptyMask(w1, h1);
+  const srcRW = mask.rowWords;
+  const dstRW = horiz.rowWords;
+  const sData = mask.data;
+  const hData = horiz.data;
+  for (let y = 0; y < h1; y++) {
+    const sBase = y * srcRW;
+    const dBase = y * dstRW;
+    for (let k = 0; k <= 2 * r; k++) {
+      const wordShift = k >>> 5;
+      const bitShift = k & 31;
+      if (bitShift === 0) {
+        for (let i = 0; i < srcRW; i++) {
+          const s = sData[sBase + i];
+          if (s !== 0) hData[dBase + i + wordShift] |= s;
+        }
+      } else {
+        const invShift = 32 - bitShift;
+        let carry = 0;
+        for (let i = 0; i < srcRW; i++) {
+          const s = sData[sBase + i];
+          hData[dBase + i + wordShift] |= (s << bitShift) | carry;
+          carry = s >>> invShift;
+        }
+        const tail = dBase + srcRW + wordShift;
+        if (carry !== 0 && tail < dBase + dstRW) hData[tail] |= carry;
       }
     }
   }
-  const out = new Uint8Array(ow * oh);
-  for (let x = 0; x < ow; x++) {
-    for (let y = 0; y < h; y++) {
-      if (tmp[y * ow + x]) {
-        for (let k = 0; k <= 2 * r; k++) out[(y + k) * ow + x] = 1;
+  const h2 = h1 + 2 * r;
+  const vert = emptyMask(w1, h2);
+  const rw = dstRW;
+  const vData = vert.data;
+  for (let sy = 0; sy < h1; sy++) {
+    const sBase = sy * rw;
+    for (let k = 0; k <= 2 * r; k++) {
+      const dBase = (sy + k) * rw;
+      for (let i = 0; i < rw; i++) {
+        const s = hData[sBase + i];
+        if (s !== 0) vData[dBase + i] |= s;
       }
     }
   }
-  return { mask: { data: out, w: ow, h: oh }, pad: r };
+  return { mask: vert, pad: r };
 }
 
 // ---------- occupancy + integral image ----------
@@ -93,36 +139,52 @@ function dilate(mask: Mask, r: number): { mask: Mask; pad: number } {
 class Occupancy {
   readonly w: number;
   readonly h: number;
-  readonly data: Uint8Array;
-  /** Integral image of `data`, size (w+1)*(h+1), Int32 for safety. */
+  /**
+   * rowWords = ceil(w/32) + 1. The extra sentinel word lets shifted
+   * collision/stamp safely read the next word without a bounds check:
+   * cells beyond column w are never set, so the sentinel is always 0.
+   */
+  readonly rowWords: number;
+  readonly data: Uint32Array;
+  /** Integral image of `data` (unpacked sums), size (w+1)*(h+1). */
   private integral: Int32Array;
-  private integralDirty = true;
+  /**
+   * Smallest row index that has been modified since the last integral
+   * rebuild. `ensureIntegral` then only rebuilds [dirtyMinY, h). Rows
+   * above dirtyMinY are unchanged, and their cumulative row-ends in the
+   * integral are still valid — making most rebuilds near-free after the
+   * occupancy fills top-down.
+   */
+  private dirtyMinY: number;
 
   constructor(w: number, h: number) {
     this.w = w;
     this.h = h;
-    this.data = new Uint8Array(w * h);
+    this.rowWords = ((w + 31) >>> 5) + 1;
+    this.data = new Uint32Array(this.rowWords * h);
     this.integral = new Int32Array((w + 1) * (h + 1));
+    this.dirtyMinY = 0;
   }
 
-  rebuildIntegral() {
+  ensureIntegral() {
+    if (this.dirtyMinY >= this.h) return;
     const W = this.w;
     const H = this.h;
     const IW = W + 1;
     const data = this.data;
     const I = this.integral;
-    // First row/col are already 0 (rebuild from scratch).
-    I.fill(0);
-    for (let y = 0; y < H; y++) {
+    const RW = this.rowWords;
+    for (let y = this.dirtyMinY; y < H; y++) {
       let rowSum = 0;
       const prevRow = y * IW;
       const row = (y + 1) * IW;
+      const base = y * RW;
       for (let x = 0; x < W; x++) {
-        rowSum += data[y * W + x];
+        rowSum += (data[base + (x >>> 5)] >>> (x & 31)) & 1;
         I[row + x + 1] = rowSum + I[prevRow + x + 1];
       }
     }
-    this.integralDirty = false;
+    this.dirtyMinY = H;
   }
 
   /** Sum of data[y:y+h, x:x+w]. Assumes integral is up-to-date. */
@@ -138,14 +200,30 @@ class Occupancy {
 
   collidesPixel(m: Mask, px: number, py: number): boolean {
     const occ = this.data;
-    const W = this.w;
-    const mw = m.w;
+    const oRW = this.rowWords;
+    const mRW = m.rowWords;
     const md = m.data;
-    for (let y = 0; y < m.h; y++) {
-      const orow = (py + y) * W + px;
-      const mrow = y * mw;
-      for (let x = 0; x < mw; x++) {
-        if (md[mrow + x] && occ[orow + x]) return true;
+    const shift = px & 31;
+    const wordOff = px >>> 5;
+    if (shift === 0) {
+      for (let y = 0; y < m.h; y++) {
+        const mBase = y * mRW;
+        const oBase = (py + y) * oRW + wordOff;
+        for (let i = 0; i < mRW; i++) {
+          if ((md[mBase + i] & occ[oBase + i]) !== 0) return true;
+        }
+      }
+    } else {
+      const inv = 32 - shift;
+      for (let y = 0; y < m.h; y++) {
+        const mBase = y * mRW;
+        const oBase = (py + y) * oRW + wordOff;
+        for (let i = 0; i < mRW; i++) {
+          const mw = md[mBase + i];
+          if (mw === 0) continue;
+          const win = (occ[oBase + i] >>> shift) | (occ[oBase + i + 1] << inv);
+          if ((mw & win) !== 0) return true;
+        }
       }
     }
     return false;
@@ -153,21 +231,31 @@ class Occupancy {
 
   stamp(m: Mask, px: number, py: number) {
     const occ = this.data;
-    const W = this.w;
-    const mw = m.w;
+    const oRW = this.rowWords;
+    const mRW = m.rowWords;
     const md = m.data;
-    for (let y = 0; y < m.h; y++) {
-      const orow = (py + y) * W + px;
-      const mrow = y * mw;
-      for (let x = 0; x < mw; x++) {
-        if (md[mrow + x]) occ[orow + x] = 1;
+    const shift = px & 31;
+    const wordOff = px >>> 5;
+    if (shift === 0) {
+      for (let y = 0; y < m.h; y++) {
+        const mBase = y * mRW;
+        const oBase = (py + y) * oRW + wordOff;
+        for (let i = 0; i < mRW; i++) occ[oBase + i] |= md[mBase + i];
+      }
+    } else {
+      const inv = 32 - shift;
+      for (let y = 0; y < m.h; y++) {
+        const mBase = y * mRW;
+        const oBase = (py + y) * oRW + wordOff;
+        for (let i = 0; i < mRW; i++) {
+          const mw = md[mBase + i];
+          if (mw === 0) continue;
+          occ[oBase + i] |= mw << shift;
+          occ[oBase + i + 1] |= mw >>> inv;
+        }
       }
     }
-    this.integralDirty = true;
-  }
-
-  ensureIntegral() {
-    if (this.integralDirty) this.rebuildIntegral();
+    if (py < this.dirtyMinY) this.dirtyMinY = py;
   }
 
   /** Mark every cell inside [x, x+w) × [y, y+h) as occupied. */
@@ -177,13 +265,28 @@ class Occupancy {
     const x1 = Math.min(this.w, x + w);
     const y1 = Math.min(this.h, y + h);
     if (x1 <= x0 || y1 <= y0) return;
-    const occ = this.data;
-    const W = this.w;
-    for (let yy = y0; yy < y1; yy++) {
-      const row = yy * W;
-      for (let xx = x0; xx < x1; xx++) occ[row + xx] = 1;
+    const data = this.data;
+    const RW = this.rowWords;
+    const wStart = x0 >>> 5;
+    const wEnd = (x1 - 1) >>> 5;
+    const loBit = x0 & 31;
+    const hiBit = (x1 - 1) & 31;
+    // JS `1 << 32` wraps to 1, so mask-of-N-bits needs a guard when N=32.
+    const lowMask = (loBit === 0 ? 0xffffffff : (0xffffffff << loBit)) >>> 0;
+    const highMask =
+      hiBit === 31 ? 0xffffffff : ((1 << (hiBit + 1)) - 1) >>> 0;
+    if (wStart === wEnd) {
+      const single = (lowMask & highMask) >>> 0;
+      for (let yy = y0; yy < y1; yy++) data[yy * RW + wStart] |= single;
+    } else {
+      for (let yy = y0; yy < y1; yy++) {
+        const base = yy * RW;
+        data[base + wStart] |= lowMask;
+        for (let wi = wStart + 1; wi < wEnd; wi++) data[base + wi] = 0xffffffff;
+        data[base + wEnd] |= highMask;
+      }
     }
-    this.integralDirty = true;
+    if (y0 < this.dirtyMinY) this.dirtyMinY = y0;
   }
 }
 
@@ -220,19 +323,35 @@ async function buildVariant(
   gctx.drawImage(full, 0, 0, gW, gH);
   const fullMask = extractMask(gctx, gW, gH, alphaThreshold);
 
+  // Opaque-bbox scan on the bitpacked mask: walk words, skip empty ones, and
+  // use clz32/ctz-equivalent bit math to get first/last set column cheaply.
+  const fmData = fullMask.data;
+  const fmRW = fullMask.rowWords;
   let minX = gW,
     minY = gH,
     maxX = -1,
     maxY = -1;
   for (let y = 0; y < gH; y++) {
-    for (let x = 0; x < gW; x++) {
-      if (fullMask.data[y * gW + x]) {
-        if (x < minX) minX = x;
-        if (y < minY) minY = y;
-        if (x > maxX) maxX = x;
-        if (y > maxY) maxY = y;
-      }
+    const base = y * fmRW;
+    let rowMin = -1;
+    let rowMax = -1;
+    for (let i = 0; i < fmRW; i++) {
+      const w = fmData[base + i];
+      if (w === 0) continue;
+      // ctz: lowest set bit index in this word.
+      const low = 31 - Math.clz32(w & -w);
+      // msb: highest set bit index in this word.
+      const high = 31 - Math.clz32(w);
+      const firstCol = i * 32 + low;
+      const lastCol = i * 32 + high;
+      if (rowMin < 0 || firstCol < rowMin) rowMin = firstCol;
+      if (lastCol > rowMax) rowMax = lastCol;
     }
+    if (rowMin < 0) continue;
+    if (rowMin < minX) minX = rowMin;
+    if (rowMax > maxX) maxX = rowMax;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
   }
   if (maxX < 0) return null;
 
@@ -248,15 +367,36 @@ async function buildVariant(
   cctx.drawImage(full, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
   const croppedBitmap = cropped.transferToImageBitmap();
 
+  // Crop the bitpacked mask. For each destination row y, read bits
+  // [minX, maxX] from source row (y+minY) and splice into destination
+  // starting at bit 0 via word-aligned shift + carry.
   const tW = maxX - minX + 1;
   const tH = maxY - minY + 1;
-  const tightData = new Uint8Array(tW * tH);
+  const tight = emptyMask(tW, tH);
+  const tRW = tight.rowWords;
+  const tData = tight.data;
+  const srcWordOff = minX >>> 5;
+  const srcShift = minX & 31;
+  const srcInv = 32 - srcShift;
   for (let y = 0; y < tH; y++) {
-    for (let x = 0; x < tW; x++) {
-      tightData[y * tW + x] = fullMask.data[(y + minY) * gW + (x + minX)];
+    const sBase = (y + minY) * fmRW + srcWordOff;
+    const dBase = y * tRW;
+    if (srcShift === 0) {
+      for (let i = 0; i < tRW; i++) tData[dBase + i] = fmData[sBase + i] | 0;
+    } else {
+      for (let i = 0; i < tRW; i++) {
+        const lo = fmData[sBase + i] >>> srcShift;
+        const hi = fmData[sBase + i + 1] << srcInv;
+        tData[dBase + i] = (lo | hi) >>> 0;
+      }
+    }
+    // Clear bits beyond column tW in the last word.
+    const tailBits = tW & 31;
+    if (tailBits !== 0) {
+      const mask = ((1 << tailBits) - 1) >>> 0;
+      tData[dBase + tRW - 1] &= mask;
     }
   }
-  const tight: Mask = { data: tightData, w: tW, h: tH };
   const { mask: dilated, pad } = dilate(tight, marginCells);
 
   return {
@@ -658,8 +798,10 @@ function buildRotationList(stepDeg: number): number[] {
 
 function maskEquals(a: Mask, b: Mask): boolean {
   if (a.w !== b.w || a.h !== b.h) return false;
-  const n = a.data.length;
-  for (let i = 0; i < n; i++) if (a.data[i] !== b.data[i]) return false;
+  const ad = a.data;
+  const bd = b.data;
+  const n = ad.length;
+  for (let i = 0; i < n; i++) if (ad[i] !== bd[i]) return false;
   return true;
 }
 
