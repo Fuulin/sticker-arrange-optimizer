@@ -84,3 +84,166 @@ export function dilate(mask: BinaryMask, radius: number): BinaryMask {
   }
   return { width: w, height: h, data: out };
 }
+
+export interface Point {
+  x: number;
+  y: number;
+}
+
+/** One closed polyline. The first point is NOT repeated at the end. */
+export type Polyline = Point[];
+
+/**
+ * Trace every closed contour in a binary mask. Uses a Moore-neighborhood
+ * boundary-following algorithm: scans for unvisited boundary pixels
+ * top-to-bottom, left-to-right, then walks each boundary clockwise back
+ * to the start. Interior holes produce their own contours (walked
+ * counter-clockwise in pixel-up coordinates, which is the SVG fill-rule
+ * interpretation of "inside").
+ *
+ * Coordinates are in mask-pixel units: integer `x` in [0, width-1],
+ * integer `y` in [0, height-1].
+ */
+export function traceContours(mask: BinaryMask): Polyline[] {
+  const { width: w, height: h, data } = mask;
+  const visited = new Uint8Array(w * h);
+  const contours: Polyline[] = [];
+
+  // Moore neighborhood offsets, clockwise starting from the cell directly
+  // above the current cell (the conventional start direction for a
+  // boundary walk that just came from the left).
+  const dx = [0, 1, 1, 1, 0, -1, -1, -1];
+  const dy = [-1, -1, 0, 1, 1, 1, 0, -1];
+
+  const at = (x: number, y: number): number =>
+    x < 0 || y < 0 || x >= w || y >= h ? 0 : data[y * w + x];
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (!data[y * w + x]) continue;
+      if (visited[y * w + x]) continue;
+      // Only start a walk when we're at a boundary pixel — i.e. the cell
+      // immediately to the left is background or we're at the left edge.
+      if (x > 0 && data[y * w + (x - 1)]) continue;
+
+      const contour: Polyline = [];
+      let cx = x;
+      let cy = y;
+      // Previous direction index: we "came from" the left (dir 6).
+      let prevDir = 6;
+
+      while (true) {
+        visited[cy * w + cx] = 1;
+        contour.push({ x: cx, y: cy });
+
+        // Search clockwise starting from (prevDir + 6) % 8, which is the
+        // cell that sits "behind-left" of our entry direction. This is
+        // the Moore-neighborhood rule for finding the next boundary
+        // pixel.
+        const startDir = (prevDir + 6) % 8;
+        let found = false;
+        for (let i = 0; i < 8; i++) {
+          const d = (startDir + i) % 8;
+          const nx = cx + dx[d];
+          const ny = cy + dy[d];
+          if (at(nx, ny)) {
+            if (nx === x && ny === y && contour.length > 2) {
+              found = true;
+              cx = -1; // sentinel to break outer loop
+              break;
+            }
+            cx = nx;
+            cy = ny;
+            prevDir = d;
+            found = true;
+            break;
+          }
+        }
+        if (!found) break; // isolated pixel
+        if (cx === -1) break;
+      }
+
+      if (contour.length >= 3) contours.push(contour);
+    }
+  }
+
+  return contours;
+}
+
+/**
+ * Ramer-Douglas-Peucker simplification. Drops intermediate points whose
+ * perpendicular distance from the straight line between the surviving
+ * anchors is less than `tolerance` mask-pixel units. Closed polylines
+ * are handled by temporarily treating the start and end as the anchor
+ * segment; the returned polyline is still closed (first point not
+ * repeated).
+ */
+export function simplifyPolyline(
+  points: Polyline,
+  tolerance: number,
+): Polyline {
+  if (points.length <= 2 || tolerance <= 0) return points.slice();
+  const sqTol = tolerance * tolerance;
+
+  const keep = new Uint8Array(points.length);
+  keep[0] = 1;
+  keep[points.length - 1] = 1;
+
+  const stack: Array<[number, number]> = [[0, points.length - 1]];
+  while (stack.length) {
+    const [lo, hi] = stack.pop()!;
+    let maxSq = -1;
+    let maxIdx = -1;
+    const ax = points[lo].x;
+    const ay = points[lo].y;
+    const bx = points[hi].x;
+    const by = points[hi].y;
+    const ex = bx - ax;
+    const ey = by - ay;
+    const len2 = ex * ex + ey * ey || 1;
+    for (let i = lo + 1; i < hi; i++) {
+      const px = points[i].x - ax;
+      const py = points[i].y - ay;
+      const t = (px * ex + py * ey) / len2;
+      const tx = t * ex - px;
+      const ty = t * ey - py;
+      const sq = tx * tx + ty * ty;
+      if (sq > maxSq) {
+        maxSq = sq;
+        maxIdx = i;
+      }
+    }
+    if (maxSq > sqTol && maxIdx > 0) {
+      keep[maxIdx] = 1;
+      stack.push([lo, maxIdx]);
+      stack.push([maxIdx, hi]);
+    }
+  }
+
+  const out: Polyline = [];
+  for (let i = 0; i < points.length; i++) {
+    if (keep[i]) out.push(points[i]);
+  }
+  return out;
+}
+
+/**
+ * Full pipeline: ImageBitmap → list of simplified, closed polylines in
+ * bitmap-pixel coordinates, each offset outward by `bleedPx` pixels.
+ * A single sticker with an interior hole yields two polylines (outer
+ * and inner). Fully transparent bitmaps yield an empty array.
+ *
+ * `simplifyTolPx` defaults to 1 pixel; callers that want ~0.3 mm at a
+ * given DPI should compute `(0.3 / 25.4) * dpi` themselves.
+ */
+export function bitmapToContours(
+  bitmap: ImageBitmap,
+  alphaThreshold: number,
+  bleedPx: number,
+  simplifyTolPx = 1,
+): Polyline[] {
+  const mask = extractAlphaMask(bitmap, alphaThreshold);
+  const expanded = dilate(mask, bleedPx);
+  const raw = traceContours(expanded);
+  return raw.map((p) => simplifyPolyline(p, simplifyTolPx));
+}
