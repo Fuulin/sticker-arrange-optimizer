@@ -228,10 +228,34 @@ export function simplifyPolyline(
 }
 
 /**
+ * Pad a mask with `pad` pixels of background on every side. Returned
+ * coordinates are shifted by `(pad, pad)`; subtract that off to map
+ * back to the original mask's coordinate frame.
+ */
+function padMask(mask: BinaryMask, pad: number): BinaryMask {
+  if (pad <= 0) return { ...mask, data: new Uint8Array(mask.data) };
+  const w = mask.width + pad * 2;
+  const h = mask.height + pad * 2;
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < mask.height; y++) {
+    out.set(
+      mask.data.subarray(y * mask.width, (y + 1) * mask.width),
+      (y + pad) * w + pad,
+    );
+  }
+  return { width: w, height: h, data: out };
+}
+
+/**
  * Full pipeline: ImageBitmap → list of simplified, closed polylines in
  * bitmap-pixel coordinates, each offset outward by `bleedPx` pixels.
  * A single sticker with an interior hole yields two polylines (outer
  * and inner). Fully transparent bitmaps yield an empty array.
+ *
+ * The mask is padded by `bleedPx + 1` before dilation so the cut
+ * contour can extend cleanly past the bitmap's original bounds —
+ * otherwise large bleeds get clipped into a rectangular silhouette
+ * instead of an organic offset of the original alpha shape.
  *
  * `simplifyTolPx` defaults to 1 pixel; callers that want ~0.3 mm at a
  * given DPI should compute `(0.3 / 25.4) * dpi` themselves.
@@ -243,7 +267,17 @@ export function bitmapToContours(
   simplifyTolPx = 1,
 ): Polyline[] {
   const mask = extractAlphaMask(bitmap, alphaThreshold);
-  const expanded = dilate(mask, bleedPx);
+  const pad = Math.max(0, Math.floor(bleedPx)) + 1;
+  const padded = padMask(mask, pad);
+  const expanded = dilate(padded, bleedPx);
   const raw = traceContours(expanded);
-  return raw.map((p) => simplifyPolyline(p, simplifyTolPx));
+  const out: Polyline[] = [];
+  for (const p of raw) {
+    const simplified = simplifyPolyline(p, simplifyTolPx);
+    // Drop degenerate contours from anti-aliasing noise: a real closed
+    // path needs at least 3 distinct vertices to enclose any area.
+    if (simplified.length < 3) continue;
+    out.push(simplified.map((pt) => ({ x: pt.x - pad, y: pt.y - pad })));
+  }
+  return out;
 }
