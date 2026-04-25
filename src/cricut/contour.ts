@@ -10,7 +10,7 @@ export interface BinaryMask {
 
 /**
  * Extract a binary alpha mask from an ImageBitmap. Pixels whose alpha
- * channel is strictly greater than `alphaThreshold` (0..255) count as
+ * channel is greater than or equal to `alphaThreshold` (0..255) count as
  * opaque.
  */
 export function extractAlphaMask(
@@ -26,7 +26,7 @@ export function extractAlphaMask(
   const img = ctx.getImageData(0, 0, w, h).data;
   const out = new Uint8Array(w * h);
   for (let i = 0, j = 3; i < out.length; i++, j += 4) {
-    out[i] = img[j] > alphaThreshold ? 1 : 0;
+    out[i] = img[j] >= alphaThreshold ? 1 : 0;
   }
   return { width: w, height: h, data: out };
 }
@@ -37,8 +37,9 @@ export function extractAlphaMask(
  * `radius` cells on any of the 8 axes. A zero or negative radius returns
  * a copy of the input mask.
  *
- * Implementation: two-pass separable dilation (horizontal then vertical)
- * using a sliding-window OR. O(w * h * radius) worst case.
+ * Implementation: two-pass separable dilation (horizontal then vertical).
+ * Naïve window scan with early-break on first set bit; O(w * h * radius)
+ * worst case, faster in practice on dense masks.
  */
 export function dilate(mask: BinaryMask, radius: number): BinaryMask {
   const r = Math.max(0, Math.floor(radius));
