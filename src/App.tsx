@@ -23,6 +23,7 @@ import {
   cmToPx,
   pxToCm,
   A4_CM,
+  CRICUT_PTC_CM,
   CM_PER_INCH,
   DPI_PRESETS,
 } from "./lib/units";
@@ -645,6 +646,17 @@ function Sidebar(props: SidebarProps) {
                 props.onCanvasHcm(A4_CM.w);
               }}
               label="A4 Landscape"
+            />
+            <PresetButton
+              active={
+                Math.abs(props.canvasWcm - CRICUT_PTC_CM.w) < 0.05 &&
+                Math.abs(props.canvasHcm - CRICUT_PTC_CM.h) < 0.05
+              }
+              onClick={() => {
+                props.onCanvasWcm(CRICUT_PTC_CM.w);
+                props.onCanvasHcm(CRICUT_PTC_CM.h);
+              }}
+              label="Cricut"
             />
           </div>
           <div>

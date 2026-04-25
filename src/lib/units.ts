@@ -12,5 +12,8 @@ export function pxToCm(px: number, dpi: number): number {
 /** A4 in cm (portrait). */
 export const A4_CM = { w: 21.0, h: 29.7 } as const;
 
+/** Cricut Print-Then-Cut standard max (9.25" × 6.75"), in cm. Landscape. */
+export const CRICUT_PTC_CM = { w: 23.495, h: 17.145 } as const;
+
 /** Preset DPI values. 300 is standard print quality. */
 export const DPI_PRESETS = [72, 150, 300, 600] as const;
