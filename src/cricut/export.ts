@@ -1,5 +1,6 @@
 import JSZip from "jszip";
 import type { Placement } from "../packer/types";
+import { CRICUT_PTC_IN, INCH_PER_MM, mmToPx } from "../lib/units";
 import { bitmapToContours, type Polyline } from "./contour";
 import {
   assignPlacementsToTiles,
@@ -15,16 +16,12 @@ export interface BuildExportInput {
   dpi: number;
   bleedMm: number;
   alphaThreshold: number;
+  /** When true, tiles with no placements assigned are excluded from the
+   * export bundle. */
+  skipEmptyTiles?: boolean;
   /** Tile size in canvas pixels. Default = 9.25" × 6.75" at `dpi`. */
   tileWidthPx?: number;
   tileHeightPx?: number;
-}
-
-const INCH_PER_MM = 1 / 25.4;
-const PTC_IN = { w: 9.25, h: 6.75 };
-
-function mmToPx(mm: number, dpi: number): number {
-  return Math.max(0, Math.round(mm * INCH_PER_MM * dpi));
 }
 
 function simplifyTolerancePx(dpi: number): number {
@@ -162,34 +159,48 @@ export interface BuildExportResult {
 export async function buildCricutExport(
   input: BuildExportInput,
 ): Promise<BuildExportResult> {
-  const tileWpx = input.tileWidthPx ?? mmToPx(PTC_IN.w * 25.4, input.dpi);
-  const tileHpx = input.tileHeightPx ?? mmToPx(PTC_IN.h * 25.4, input.dpi);
-  const tiles = tileCanvas(
+  const tileWpx =
+    input.tileWidthPx ?? mmToPx(CRICUT_PTC_IN.w * 25.4, input.dpi);
+  const tileHpx =
+    input.tileHeightPx ?? mmToPx(CRICUT_PTC_IN.h * 25.4, input.dpi);
+  const allTiles = tileCanvas(
     input.canvasWidthPx,
     input.canvasHeightPx,
     tileWpx,
     tileHpx,
   );
-  const assign = assignPlacementsToTiles(input.placements, tiles);
+  const assign = assignPlacementsToTiles(input.placements, allTiles);
+
+  // Pick the tiles that will actually appear in the export. When
+  // `skipEmptyTiles` is on, drop any tile whose centroid-assigned list
+  // is empty — those would yield a blank Cricut sheet the user has to
+  // skip manually otherwise.
+  const exported: Array<{ tile: Tile; placements: Placement[] }> = [];
+  for (let i = 0; i < allTiles.length; i++) {
+    const placements = assign.get(i) ?? [];
+    if (input.skipEmptyTiles && placements.length === 0) continue;
+    exported.push({ tile: allTiles[i], placements });
+  }
+
   const files: BuildExportResult["files"] = [];
-  const total = tiles.length;
-  for (let i = 0; i < tiles.length; i++) {
-    const tilePlacements = assign.get(i) ?? [];
+  const total = exported.length;
+  for (let i = 0; i < exported.length; i++) {
+    const { tile, placements } = exported[i];
     const svg = await buildTileSvg(
-      tiles[i],
-      tilePlacements,
+      tile,
+      placements,
       input.variantBitmaps,
       input.bleedMm,
       input.alphaThreshold,
       input.dpi,
     );
-    const err = selfCheckSvg(svg, tiles[i].width, tiles[i].height);
+    const err = selfCheckSvg(svg, tile.width, tile.height);
     if (err) throw new Error(`SVG self-check failed for tile ${i + 1}: ${err}`);
     const name =
       total === 1 ? "tile.svg" : `tile-${i + 1}-of-${total}.svg`;
     files.push({ name, svg });
   }
-  return { files, tiles };
+  return { files, tiles: exported.map((e) => e.tile) };
 }
 
 /** Browser download helper. */

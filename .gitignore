@@ -5,3 +5,7 @@ dist
 .wrangler
 .dev.vars
 *.tsbuildinfo
+
+# Playwright MCP artifacts (snapshots, downloads, test fixtures)
+.playwright-mcp/
+step-*.png

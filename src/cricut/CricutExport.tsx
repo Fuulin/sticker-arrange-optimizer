@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { PackResult, Placement } from "../packer/types";
+import { CRICUT_PTC_IN, mmToPx } from "../lib/units";
 import {
   tileCanvas,
   assignPlacementsToTiles,
@@ -18,27 +19,24 @@ export interface CricutExportProps {
   canvasWidthPx: number;
   canvasHeightPx: number;
   dpi: number;
+  /** Alpha-channel threshold (0-255) inherited from the main page so cut
+   * paths trace the same opaque region the packer used for collisions. */
+  alphaThreshold: number;
   onBack: () => void;
-}
-
-const INCH_PER_MM = 1 / 25.4;
-const PTC_IN = { w: 9.25, h: 6.75 };
-
-function mmToPx(mm: number, dpi: number): number {
-  return Math.max(0, Math.round(mm * INCH_PER_MM * dpi));
 }
 
 export function CricutExport(props: CricutExportProps) {
   const [bleedMm, setBleedMm] = useState(1);
   const [showCut, setShowCut] = useState(true);
   const [showGrid, setShowGrid] = useState(true);
+  const [skipEmptyTiles, setSkipEmptyTiles] = useState(true);
 
   const tileWpx = useMemo(
-    () => mmToPx(PTC_IN.w * 25.4, props.dpi),
+    () => mmToPx(CRICUT_PTC_IN.w * 25.4, props.dpi),
     [props.dpi],
   );
   const tileHpx = useMemo(
-    () => mmToPx(PTC_IN.h * 25.4, props.dpi),
+    () => mmToPx(CRICUT_PTC_IN.h * 25.4, props.dpi),
     [props.dpi],
   );
   const tiles = useMemo(
@@ -68,6 +66,17 @@ export function CricutExport(props: CricutExportProps) {
     return out;
   }, [assignment, tiles]);
 
+  // How many tiles the export will actually produce, factoring in the
+  // skip-empty-tiles toggle.
+  const exportedTileCount = useMemo(() => {
+    if (!skipEmptyTiles) return tiles.length;
+    let n = 0;
+    for (let i = 0; i < tiles.length; i++) {
+      if ((assignment.get(i) ?? []).length > 0) n++;
+    }
+    return n;
+  }, [tiles, assignment, skipEmptyTiles]);
+
   const [contours, setContours] = useState<Map<Placement, Polyline[]>>(
     new Map(),
   );
@@ -88,11 +97,12 @@ export function CricutExport(props: CricutExportProps) {
         if (!bmp) continue;
         const sx = p.width / bmp.width;
         const sy = p.height / bmp.height;
-        // NOTE: the packer's alpha threshold is not currently threaded
-        // through to the Cricut view. Use 16 (the existing default) as a
-        // fixed value; if this becomes user-configurable later it can be
-        // surfaced as a prop.
-        const raw = bitmapToContours(bmp, 16, bleedPx, simpTol);
+        const raw = bitmapToContours(
+          bmp,
+          props.alphaThreshold,
+          bleedPx,
+          simpTol,
+        );
         const scaled = raw.map((poly) =>
           poly.map((pt) => ({ x: pt.x * sx, y: pt.y * sy })),
         );
@@ -108,7 +118,13 @@ export function CricutExport(props: CricutExportProps) {
       window.clearTimeout(handle);
       setComputing(false);
     };
-  }, [bleedMm, props.result.placements, props.variantBitmaps, props.dpi]);
+  }, [
+    bleedMm,
+    props.result.placements,
+    props.variantBitmaps,
+    props.dpi,
+    props.alphaThreshold,
+  ]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -161,7 +177,8 @@ export function CricutExport(props: CricutExportProps) {
         canvasHeightPx: props.canvasHeightPx,
         dpi: props.dpi,
         bleedMm,
-        alphaThreshold: 16,
+        alphaThreshold: props.alphaThreshold,
+        skipEmptyTiles,
       });
       const wcm = ((props.canvasWidthPx * 2.54) / props.dpi).toFixed(1);
       const hcm = ((props.canvasHeightPx * 2.54) / props.dpi).toFixed(1);
@@ -188,8 +205,14 @@ export function CricutExport(props: CricutExportProps) {
         </button>
         <div className="text-sm font-semibold">Cricut Export</div>
         <div className="ml-auto text-xs text-neutral-400 tabular-nums">
-          {tiles.length} tile{tiles.length === 1 ? "" : "s"} · {totalPlaced}{" "}
-          sticker{totalPlaced === 1 ? "" : "s"}
+          {exportedTileCount} tile{exportedTileCount === 1 ? "" : "s"}
+          {skipEmptyTiles && exportedTileCount < tiles.length ? (
+            <span className="text-neutral-500">
+              {" "}
+              (of {tiles.length})
+            </span>
+          ) : null}{" "}
+          · {totalPlaced} sticker{totalPlaced === 1 ? "" : "s"}
           {overhanging.size > 0 ? (
             <span className="ml-2 text-amber-400">
               · {overhanging.size} over boundary
@@ -231,19 +254,27 @@ export function CricutExport(props: CricutExportProps) {
             />
             Show tile grid
           </label>
+          <label className="flex items-center gap-2 text-xs text-neutral-300">
+            <input
+              type="checkbox"
+              checked={skipEmptyTiles}
+              onChange={(e) => setSkipEmptyTiles(e.target.checked)}
+            />
+            Skip empty tiles
+          </label>
           <div className="mt-auto flex flex-col gap-2">
             <button
               type="button"
               onClick={onDownload}
-              disabled={downloading}
+              disabled={downloading || exportedTileCount === 0}
               className="flex w-full items-center justify-center gap-2 rounded-md bg-neutral-100 px-3 py-2 text-sm font-medium text-neutral-900 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
             >
               {downloading
                 ? "Exporting…"
                 : `Download ${
-                    tiles.length === 1
+                    exportedTileCount === 1
                       ? ".svg"
-                      : `.zip (${tiles.length} files)`
+                      : `.zip (${exportedTileCount} files)`
                   }`}
             </button>
             {downloadError ? (

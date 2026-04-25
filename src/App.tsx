@@ -493,6 +493,7 @@ export default function App() {
         canvasWidthPx={pack.canvasWidthPx}
         canvasHeightPx={pack.canvasHeightPx}
         dpi={dpi}
+        alphaThreshold={alpha}
         onBack={() => setView("pack")}
       />
     );
