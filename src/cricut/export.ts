@@ -79,6 +79,7 @@ async function buildTileSvg(
   bleedMm: number,
   alphaThreshold: number,
   dpi: number,
+  contourCache: WeakMap<ImageBitmap, Polyline[]>,
 ): Promise<string> {
   const pngUrl = await renderTilePng(tile, placements, variantBitmaps);
   const bleedPx = mmToPx(bleedMm, dpi);
@@ -89,15 +90,14 @@ async function buildTileSvg(
     const variants = variantBitmaps[p.stickerId];
     const bmp = variants?.[p.variantIdx];
     if (!bmp) continue;
-    const contours = bitmapToContours(bmp, alphaThreshold, bleedPx, simpTol);
-    // Contour points are in the variant bitmap's local coordinates. The
-    // packer draws the bitmap at (p.x, p.y) with p.width x p.height. The
-    // bitmap is already pre-scaled to those dims, so a 1:1 mapping:
-    //   canvas_x = p.x + contour_x
-    // works because bitmap.width === p.width and bitmap.height === p.height
-    // (the packer stores the cropped/rotated variants at their final
-    // draw size).
-    // To be safe against scale drift we compute an explicit scale.
+    let contours = contourCache.get(bmp);
+    if (!contours) {
+      contours = bitmapToContours(bmp, alphaThreshold, bleedPx, simpTol);
+      contourCache.set(bmp, contours);
+    }
+    // Variants are pre-scaled by the packer so bitmap.width === p.width
+    // in current code, but we recompute scale to be robust to future
+    // packer changes.
     const sx = p.width / bmp.width;
     const sy = p.height / bmp.height;
     for (const poly of contours) {
@@ -184,6 +184,9 @@ export async function buildCricutExport(
 
   const files: BuildExportResult["files"] = [];
   const total = exported.length;
+  // Cache traced contours by bitmap identity so each bitmap is processed
+  // once even when many placements (and tiles) reference it.
+  const contourCache = new WeakMap<ImageBitmap, Polyline[]>();
   for (let i = 0; i < exported.length; i++) {
     const { tile, placements } = exported[i];
     const svg = await buildTileSvg(
@@ -193,6 +196,7 @@ export async function buildCricutExport(
       input.bleedMm,
       input.alphaThreshold,
       input.dpi,
+      contourCache,
     );
     const err = selfCheckSvg(svg, tile.width, tile.height);
     if (err) throw new Error(`SVG self-check failed for tile ${i + 1}: ${err}`);

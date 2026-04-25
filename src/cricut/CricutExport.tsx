@@ -82,6 +82,14 @@ export function CricutExport(props: CricutExportProps) {
   );
   const [computing, setComputing] = useState(false);
 
+  // Cache keyed by `${bitmap-identity}|alpha|bleedPx|simpTol`. Most stickers
+  // share bitmaps (e.g. 8 placements of "circle.png" all reference the same
+  // ImageBitmap), so we trace each bitmap once per (alpha, bleed, dpi)
+  // combo and reuse the result across placements and slider drags.
+  const contourCacheRef = useRef(
+    new WeakMap<ImageBitmap, Map<string, Polyline[]>>(),
+  );
+
   // Debounced contour recompute on bleed/placement changes.
   useEffect(() => {
     let cancelled = false;
@@ -90,19 +98,30 @@ export function CricutExport(props: CricutExportProps) {
       const next = new Map<Placement, Polyline[]>();
       const bleedPx = mmToPx(bleedMm, props.dpi);
       const simpTol = Math.max(1, Math.round((0.3 / 25.4) * props.dpi));
+      const paramKey = `${props.alphaThreshold}|${bleedPx}|${simpTol}`;
+      const cache = contourCacheRef.current;
       for (const p of props.result.placements) {
         if (cancelled) break;
         const variants = props.variantBitmaps[p.stickerId];
         const bmp = variants?.[p.variantIdx];
         if (!bmp) continue;
+        let perBmp = cache.get(bmp);
+        if (!perBmp) {
+          perBmp = new Map();
+          cache.set(bmp, perBmp);
+        }
+        let raw = perBmp.get(paramKey);
+        if (!raw) {
+          raw = bitmapToContours(
+            bmp,
+            props.alphaThreshold,
+            bleedPx,
+            simpTol,
+          );
+          perBmp.set(paramKey, raw);
+        }
         const sx = p.width / bmp.width;
         const sy = p.height / bmp.height;
-        const raw = bitmapToContours(
-          bmp,
-          props.alphaThreshold,
-          bleedPx,
-          simpTol,
-        );
         const scaled = raw.map((poly) =>
           poly.map((pt) => ({ x: pt.x * sx, y: pt.y * sy })),
         );
