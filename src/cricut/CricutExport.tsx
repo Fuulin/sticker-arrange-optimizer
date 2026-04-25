@@ -7,6 +7,10 @@ import {
   type Tile,
 } from "./tiles";
 import { bitmapToContours, type Polyline } from "./contour";
+import {
+  buildCricutExport,
+  downloadCricutExport,
+} from "./export";
 
 export interface CricutExportProps {
   result: PackResult;
@@ -144,6 +148,34 @@ export function CricutExport(props: CricutExportProps) {
 
   const totalPlaced = props.result.placements.length;
 
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const onDownload = async () => {
+    setDownloading(true);
+    setDownloadError(null);
+    try {
+      const result = await buildCricutExport({
+        placements: props.result.placements,
+        variantBitmaps: props.variantBitmaps,
+        canvasWidthPx: props.canvasWidthPx,
+        canvasHeightPx: props.canvasHeightPx,
+        dpi: props.dpi,
+        bleedMm,
+        alphaThreshold: 16,
+      });
+      const wcm = ((props.canvasWidthPx * 2.54) / props.dpi).toFixed(1);
+      const hcm = ((props.canvasHeightPx * 2.54) / props.dpi).toFixed(1);
+      const base = `cricut-${wcm}x${hcm}cm`;
+      await downloadCricutExport(result, base);
+    } catch (err) {
+      setDownloadError(
+        err instanceof Error ? err.message : "Export failed",
+      );
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   return (
     <div className="flex h-dvh w-full flex-col bg-neutral-950 text-neutral-100">
       <header className="flex items-center gap-3 border-b border-neutral-800 px-5 py-3">
@@ -199,13 +231,25 @@ export function CricutExport(props: CricutExportProps) {
             />
             Show tile grid
           </label>
-          <button
-            type="button"
-            disabled
-            className="mt-auto flex w-full items-center justify-center gap-2 rounded-md bg-neutral-100 px-3 py-2 text-sm font-medium text-neutral-900 disabled:opacity-50"
-          >
-            Download {tiles.length === 1 ? ".svg" : `.zip (${tiles.length} files)`}
-          </button>
+          <div className="mt-auto flex flex-col gap-2">
+            <button
+              type="button"
+              onClick={onDownload}
+              disabled={downloading}
+              className="flex w-full items-center justify-center gap-2 rounded-md bg-neutral-100 px-3 py-2 text-sm font-medium text-neutral-900 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {downloading
+                ? "Exporting…"
+                : `Download ${
+                    tiles.length === 1
+                      ? ".svg"
+                      : `.zip (${tiles.length} files)`
+                  }`}
+            </button>
+            {downloadError ? (
+              <p className="text-xs text-red-400">{downloadError}</p>
+            ) : null}
+          </div>
         </aside>
 
         {/* Preview */}
