@@ -125,8 +125,12 @@ async function buildTileSvg(
 `;
 }
 
-/** Lightweight structural check: parses, has both layers, has cut paths. */
-function selfCheckSvg(svg: string): string | null {
+/** Lightweight structural check: parses, has both layers, dimensions match. */
+function selfCheckSvg(
+  svg: string,
+  expectedWidth: number,
+  expectedHeight: number,
+): string | null {
   const parser = new DOMParser();
   const doc = parser.parseFromString(svg, "image/svg+xml");
   if (doc.getElementsByTagName("parsererror").length > 0) {
@@ -134,8 +138,18 @@ function selfCheckSvg(svg: string): string | null {
   }
   if (!doc.getElementById("print")) return "missing print layer";
   if (!doc.getElementById("cut")) return "missing cut layer";
-  const paths = doc.querySelectorAll("#cut path");
-  if (paths.length === 0) return "no cut paths";
+
+  // Dimension validation.
+  const img = doc.querySelector("#print image");
+  if (!img) return "missing print image";
+  if (Number(img.getAttribute("width")) !== expectedWidth)
+    return "print width mismatch";
+  if (Number(img.getAttribute("height")) !== expectedHeight)
+    return "print height mismatch";
+  const viewBox = doc.documentElement.getAttribute("viewBox");
+  if (viewBox !== `0 0 ${expectedWidth} ${expectedHeight}`)
+    return "viewBox mismatch";
+
   return null;
 }
 
@@ -169,7 +183,7 @@ export async function buildCricutExport(
       input.alphaThreshold,
       input.dpi,
     );
-    const err = selfCheckSvg(svg);
+    const err = selfCheckSvg(svg, tiles[i].width, tiles[i].height);
     if (err) throw new Error(`SVG self-check failed for tile ${i + 1}: ${err}`);
     const name =
       total === 1 ? "tile.svg" : `tile-${i + 1}-of-${total}.svg`;
