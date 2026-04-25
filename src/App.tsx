@@ -38,6 +38,7 @@ import type {
   SerializablePackRequest,
   WorkerOutMessage,
 } from "./packer/types";
+import { CricutExport } from "./cricut/CricutExport";
 
 // ======================================================================
 // Types & defaults
@@ -149,6 +150,8 @@ export default function App() {
     canvasWidthPx,
     canvasHeightPx,
   });
+
+  const [view, setView] = useState<"pack" | "cricut">("pack");
 
   // -------------------- Worker --------------------
   // Each pack run owns its own Worker instance. When the user tweaks
@@ -482,6 +485,19 @@ export default function App() {
     }
   }, [pack, canvasWcm, canvasHcm, dpi]);
 
+  if (view === "cricut" && pack.result) {
+    return (
+      <CricutExport
+        result={pack.result}
+        variantBitmaps={pack.variantBitmaps}
+        canvasWidthPx={pack.canvasWidthPx}
+        canvasHeightPx={pack.canvasHeightPx}
+        dpi={dpi}
+        onBack={() => setView("pack")}
+      />
+    );
+  }
+
   return (
     <div className="flex h-dvh w-full overflow-hidden bg-neutral-950 text-neutral-100">
       <Sidebar
@@ -514,6 +530,7 @@ export default function App() {
         onRemoveSelection={removeFromSelection}
         pack={pack}
         onDownload={downloadPng}
+        onExportCricut={() => setView("cricut")}
         downloading={downloading}
       />
       <PreviewPane
@@ -576,6 +593,7 @@ interface SidebarProps {
   onRemoveSelection: (id: string) => void;
   pack: PackState;
   onDownload: () => void;
+  onExportCricut: () => void;
   downloading: boolean;
 }
 
@@ -859,6 +877,15 @@ function Sidebar(props: SidebarProps) {
             <Download className="size-4" />
           )}
           Download PNG
+        </button>
+        <button
+          type="button"
+          onClick={props.onExportCricut}
+          disabled={!props.pack.result}
+          className="mt-2 flex w-full items-center justify-center gap-2 rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm font-medium text-neutral-200 transition-colors hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
+          title={props.pack.result ? "" : "Pack some stickers first"}
+        >
+          Export for Cricut →
         </button>
         {props.pack.error ? (
           <p className="mt-2 text-xs text-red-400">{props.pack.error}</p>
