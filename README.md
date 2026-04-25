@@ -18,6 +18,10 @@ places as many as will fit — respecting each sticker's actual opaque shape
 - **Optional 90° rotations** — try all four orientations for tighter fits.
 - **Web Worker** — packing runs off the main thread; the UI stays smooth.
 - **Download PNG** — export the packed canvas at full resolution.
+- **Cricut export** — one-click Print-Then-Cut bundle: each sticker gets
+  a cut path traced around its opaque edge with an adjustable bleed,
+  packed as SVG(s) ready to drag into Cricut Design Space. Canvases
+  larger than 9.25″×6.75″ auto-tile into a zip, one SVG per page.
 
 ## Stack
 
