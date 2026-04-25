@@ -6,6 +6,7 @@ import {
   placementFitsInTile,
   type Tile,
 } from "./tiles";
+import { bitmapToContours, type Polyline } from "./contour";
 
 export interface CricutExportProps {
   result: PackResult;
@@ -62,6 +63,48 @@ export function CricutExport(props: CricutExportProps) {
     }
     return out;
   }, [assignment, tiles]);
+
+  const [contours, setContours] = useState<Map<Placement, Polyline[]>>(
+    new Map(),
+  );
+  const [computing, setComputing] = useState(false);
+
+  // Debounced contour recompute on bleed/placement changes.
+  useEffect(() => {
+    let cancelled = false;
+    const handle = window.setTimeout(async () => {
+      setComputing(true);
+      const next = new Map<Placement, Polyline[]>();
+      const bleedPx = mmToPx(bleedMm, props.dpi);
+      const simpTol = Math.max(1, Math.round((0.3 / 25.4) * props.dpi));
+      for (const p of props.result.placements) {
+        if (cancelled) break;
+        const variants = props.variantBitmaps[p.stickerId];
+        const bmp = variants?.[p.variantIdx];
+        if (!bmp) continue;
+        const sx = p.width / bmp.width;
+        const sy = p.height / bmp.height;
+        // NOTE: the packer's alpha threshold is not currently threaded
+        // through to the Cricut view. Use 16 (the existing default) as a
+        // fixed value; if this becomes user-configurable later it can be
+        // surfaced as a prop.
+        const raw = bitmapToContours(bmp, 16, bleedPx, simpTol);
+        const scaled = raw.map((poly) =>
+          poly.map((pt) => ({ x: pt.x * sx, y: pt.y * sy })),
+        );
+        next.set(p, scaled);
+      }
+      if (!cancelled) {
+        setContours(next);
+        setComputing(false);
+      }
+    }, 150);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+      setComputing(false);
+    };
+  }, [bleedMm, props.result.placements, props.variantBitmaps, props.dpi]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -170,6 +213,11 @@ export function CricutExport(props: CricutExportProps) {
           ref={wrapRef}
           className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-neutral-900"
         >
+          {computing ? (
+            <div className="absolute right-4 top-4 rounded-md bg-neutral-800/80 px-2 py-1 text-[11px] text-neutral-300">
+              Recomputing cut lines…
+            </div>
+          ) : null}
           <div
             className="relative shadow-2xl ring-1 ring-neutral-800"
             style={{
@@ -194,6 +242,7 @@ export function CricutExport(props: CricutExportProps) {
               overhanging={overhanging}
               showCut={showCut}
               showGrid={showGrid}
+              contours={contours}
             />
           </div>
         </div>
@@ -211,8 +260,8 @@ function OverlaySvg(props: {
   overhanging: Set<Placement>;
   showCut: boolean;
   showGrid: boolean;
+  contours: Map<Placement, Polyline[]>;
 }) {
-  // Placeholder — no drawing yet. Will be filled in Task 8.
   return (
     <svg
       className="pointer-events-none absolute inset-0"
@@ -220,6 +269,65 @@ function OverlaySvg(props: {
       height={props.canvasHeightPx * props.scale}
       viewBox={`0 0 ${props.canvasWidthPx} ${props.canvasHeightPx}`}
       preserveAspectRatio="none"
-    />
+    >
+      {props.showGrid ? (
+        <g stroke="#3b82f6" strokeWidth={4} fill="none" opacity={0.8}>
+          {props.tiles.map((t, i) => (
+            <rect
+              key={i}
+              x={t.x}
+              y={t.y}
+              width={t.width}
+              height={t.height}
+            />
+          ))}
+        </g>
+      ) : null}
+
+      {props.showCut ? (
+        <g
+          stroke="#ef4444"
+          strokeWidth={Math.max(1, 2 / props.scale)}
+          fill="none"
+          vectorEffect="non-scaling-stroke"
+        >
+          {props.placements.map((p, i) => {
+            const polys = props.contours.get(p);
+            if (!polys) return null;
+            return polys.map((poly, j) => {
+              if (!poly.length) return null;
+              const d =
+                `M ${poly[0].x + p.x} ${poly[0].y + p.y} ` +
+                poly
+                  .slice(1)
+                  .map((pt) => `L ${pt.x + p.x} ${pt.y + p.y}`)
+                  .join(" ") +
+                " Z";
+              return <path key={`${i}-${j}`} d={d} />;
+            });
+          })}
+        </g>
+      ) : null}
+
+      <g
+        stroke="#eab308"
+        strokeWidth={Math.max(2, 3 / props.scale)}
+        fill="none"
+        vectorEffect="non-scaling-stroke"
+        strokeDasharray="8 4"
+      >
+        {props.placements
+          .filter((p) => props.overhanging.has(p))
+          .map((p, i) => (
+            <rect
+              key={i}
+              x={p.x}
+              y={p.y}
+              width={p.width}
+              height={p.height}
+            />
+          ))}
+      </g>
+    </svg>
   );
 }
