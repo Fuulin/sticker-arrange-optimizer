@@ -24,9 +24,11 @@ import {
   pxToCm,
   A4_CM,
   CRICUT_PTC_CM,
+  CRICUT_PTC_IN,
   CM_PER_INCH,
   DPI_PRESETS,
 } from "./lib/units";
+import { tileCanvas } from "./cricut/tiles";
 import {
   importFiles,
   disposeLibrarySticker,
@@ -110,6 +112,7 @@ export default function App() {
   const [alpha, setAlpha] = useState(DEFAULT_ALPHA);
   const [stride, setStride] = useState(2);
   const [rotationStep, setRotationStep] = useState(15);
+  const [packMode, setPackMode] = useState<"tiles" | "single">("tiles");
   const [galleryOpen, setGalleryOpen] = useState(false);
   const [importing, setImporting] = useState(false);
 
@@ -258,8 +261,81 @@ export default function App() {
   }, []);
 
   // -------------------- Packer --------------------
-  const runPack = useCallback(
+  /**
+   * Run a single pack job in a fresh Worker and resolve once the job is
+   * fully done (after `extraFits` lands or `done` is followed by an
+   * error). Reports streaming snapshots through the supplied callbacks.
+   * The caller is responsible for cancellation: bumping `reqIdRef` while
+   * a job is mid-flight makes every callback no-op (handler gates on it)
+   * and `workerRef.current?.terminate()` will kill the worker outright.
+   */
+  const dispatchSinglePack = useCallback(
     (
+      reqId: number,
+      req: SerializablePackRequest,
+      transfers: Transferable[],
+      callbacks: {
+        onVariants: (variants: Record<string, ImageBitmap[]>) => void;
+        onPartial: (snapshot: import("./packer/types").PackSnapshot) => void;
+        onProgress: (placed: number, requested: number) => void;
+        onDone: (result: PackResult) => void;
+        onExtraFits: (extraFits: Record<string, number>) => void;
+        onError: (message: string) => void;
+      },
+    ): Promise<void> =>
+      new Promise<void>((resolve) => {
+        if (reqId !== reqIdRef.current) {
+          // Pre-empted before we even started — drop transferables.
+          for (const t of transfers) {
+            if (t instanceof ImageBitmap) t.close();
+          }
+          resolve();
+          return;
+        }
+        // Kill the previous worker (if any) — only one pack runs at a time.
+        if (workerRef.current) {
+          workerRef.current.terminate();
+          workerRef.current = null;
+        }
+        const worker = new Worker(
+          new URL("./packer/worker.ts", import.meta.url),
+          { type: "module" },
+        );
+        workerRef.current = worker;
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          worker.removeEventListener("message", handler);
+          resolve();
+        };
+        const handler = (e: MessageEvent<WorkerOutMessage>) => {
+          if (reqId !== reqIdRef.current) return;
+          const msg = e.data;
+          if (msg.type === "progress") {
+            callbacks.onProgress(msg.placed, msg.requested);
+          } else if (msg.type === "variants") {
+            callbacks.onVariants(msg.variantBitmaps);
+          } else if (msg.type === "partial") {
+            callbacks.onPartial(msg.snapshot);
+          } else if (msg.type === "done") {
+            callbacks.onDone(msg.result);
+          } else if (msg.type === "extraFits") {
+            callbacks.onExtraFits(msg.extraFits);
+            finish();
+          } else if (msg.type === "error") {
+            callbacks.onError(msg.message);
+            finish();
+          }
+        };
+        worker.addEventListener("message", handler);
+        worker.postMessage({ type: "pack", request: req }, transfers);
+      }),
+    [],
+  );
+
+  const runPack = useCallback(
+    async (
       lib: LibrarySticker[],
       sel: SelectionEntry[],
       canvasWPx: number,
@@ -270,6 +346,7 @@ export default function App() {
       strideArg: number,
       rotStepDeg: number,
       dpiArg: number,
+      mode: "tiles" | "single",
     ) => {
       const libMap = new Map(lib.map((l) => [l.id, l]));
       const effective = sel
@@ -284,6 +361,9 @@ export default function App() {
           workerRef.current.terminate();
           workerRef.current = null;
         }
+        // Bump reqId so any stale callbacks from an in-flight tile
+        // chain become no-ops as soon as they fire.
+        ++reqIdRef.current;
         setPack((prev) => {
           disposeVariantBitmaps(prev.variantBitmaps);
           return {
@@ -300,61 +380,97 @@ export default function App() {
         return;
       }
 
-      // Kill any in-flight worker so its pending messages are dropped
-      // and the CPU is freed for the new run. The previous run's
-      // variantBitmaps are disposed in the setPack below.
-      if (workerRef.current) {
-        workerRef.current.terminate();
-        workerRef.current = null;
-      }
-      const worker = new Worker(
-        new URL("./packer/worker.ts", import.meta.url),
-        { type: "module" },
-      );
-      workerRef.current = worker;
-
       const reqId = ++reqIdRef.current;
+      const totalRequested = effective.reduce(
+        (a, x) => a + x.entry.quantity,
+        0,
+      );
+      // Reset pack state. Free the previous run's bitmaps. Keep the
+      // previous `result` so the canvas doesn't flash blank — the first
+      // `partial` (or `done`) of the new run will replace it.
       setPack((prev) => {
-        // Free the previous run's bitmaps. Keep `result` around (so the
-        // canvas doesn't flash blank) until the new run emits its first
-        // `partial` message — at which point it will be replaced.
         disposeVariantBitmaps(prev.variantBitmaps);
         return {
           ...prev,
           loading: true,
           error: null,
           progressPlaced: 0,
-          progressRequested: effective.reduce(
-            (a, x) => a + x.entry.quantity,
-            0,
-          ),
+          progressRequested: totalRequested,
           variantBitmaps: {},
           canvasWidthPx: canvasWPx,
           canvasHeightPx: canvasHPx,
         };
       });
 
-      Promise.all(
-        effective.map(async ({ entry, lib: l }) => {
-          // Resample bitmap so that its px dimensions equal the sticker's
-          // *intended* physical size at the canvas DPI.
-          const factor = entry.scale * (dpiArg / l.nativeDpi);
-          const bmp = await rasterizeAtFactor(l.bitmap, factor);
-          return {
-            id: entry.id,
-            bitmap: bmp,
-            quantity: entry.quantity,
-          };
-        }),
-      ).then((clones) => {
-        if (reqId !== reqIdRef.current || workerRef.current !== worker) {
-          // A newer pack request superseded us during rasterization.
+      // ---- Compute the tile grid (single-canvas mode = 1 tile == full canvas).
+      const tileWpx = mmToPx(CRICUT_PTC_IN.w * 25.4, dpiArg);
+      const tileHpx = mmToPx(CRICUT_PTC_IN.h * 25.4, dpiArg);
+      const tiles =
+        mode === "tiles"
+          ? tileCanvas(canvasWPx, canvasHPx, tileWpx, tileHpx)
+          : [
+              {
+                col: 0,
+                row: 0,
+                x: 0,
+                y: 0,
+                width: canvasWPx,
+                height: canvasHPx,
+              },
+            ];
+      const tileCount = tiles.length;
+
+      // ---- Round-robin distribute each sticker's qty across tiles.
+      // Tile i of N receives floor(qty / N) plus 1 extra if i < (qty % N).
+      const perTileQty = (qty: number, i: number): number => {
+        const base = Math.floor(qty / tileCount);
+        const rem = qty % tileCount;
+        return base + (i < rem ? 1 : 0);
+      };
+
+      // Accumulators across the chain. Placements are merged with each
+      // tile's origin baked into (x, y); variants from later tiles are
+      // skipped if a previous tile already supplied the same sticker
+      // (variant ordering is deterministic per source bitmap + rotation
+      // step, so indices are stable across tiles).
+      const mergedPlacements: Placement[] = [];
+      const mergedVariants: Record<string, ImageBitmap[]> = {};
+      const mergedExtraFits: Record<string, number> = {};
+      const mergedPerSticker: Record<
+        string,
+        { requested: number; placed: number }
+      > = {};
+      let placedSoFar = 0;
+
+      for (let i = 0; i < tileCount; i++) {
+        if (reqId !== reqIdRef.current) return;
+        const tile = tiles[i];
+        const stickersForTile = effective
+          .map(({ entry, lib: l }) => ({
+            entry,
+            lib: l,
+            qty: perTileQty(entry.quantity, i),
+          }))
+          .filter((x) => x.qty > 0);
+        if (stickersForTile.length === 0) continue;
+
+        // Rasterize at canvas DPI. Each sub-pack needs its own freshly
+        // rasterized bitmaps because Workers transfer ownership.
+        const clones = await Promise.all(
+          stickersForTile.map(async ({ entry, lib: l, qty }) => {
+            const factor = entry.scale * (dpiArg / l.nativeDpi);
+            const bmp = await rasterizeAtFactor(l.bitmap, factor);
+            return { id: entry.id, bitmap: bmp, quantity: qty };
+          }),
+        );
+        if (reqId !== reqIdRef.current) {
           clones.forEach((c) => c.bitmap.close());
           return;
         }
+
         const req: SerializablePackRequest = {
-          canvasWidth: canvasWPx,
-          canvasHeight: canvasHPx,
+          canvasWidth: tile.width,
+          canvasHeight: tile.height,
           margin: marginPxArg,
           padding: paddingPxArg,
           stride: strideArg,
@@ -363,70 +479,129 @@ export default function App() {
           stickers: clones,
         };
         const transfers: Transferable[] = clones.map((c) => c.bitmap);
-        const handler = (e: MessageEvent<WorkerOutMessage>) => {
-          if (reqId !== reqIdRef.current) return;
-          const msg = e.data;
-          if (msg.type === "progress") {
+
+        const offsetPlacements = (list: Placement[]): Placement[] =>
+          list.map((p) => ({ ...p, x: p.x + tile.x, y: p.y + tile.y }));
+
+        await dispatchSinglePack(reqId, req, transfers, {
+          onVariants: (variants) => {
+            // Merge: keep first occurrence, close duplicates.
+            const next: Record<string, ImageBitmap[]> = { ...mergedVariants };
+            for (const [id, arr] of Object.entries(variants)) {
+              if (next[id]) {
+                for (const b of arr) b.close();
+              } else {
+                next[id] = arr;
+              }
+            }
+            for (const [id, arr] of Object.entries(next)) {
+              mergedVariants[id] = arr;
+            }
+            setPack((p) => ({ ...p, variantBitmaps: { ...mergedVariants } }));
+          },
+          onProgress: (placed, _requested) => {
             setPack((p) => ({
               ...p,
-              progressPlaced: msg.placed,
-              progressRequested: msg.requested,
+              progressPlaced: placedSoFar + placed,
+              progressRequested: totalRequested,
             }));
-          } else if (msg.type === "variants") {
-            // First message of the stream: store the bitmaps so every
-            // subsequent `partial` / `done` snapshot can be rendered.
+          },
+          onPartial: (snapshot) => {
+            const merged = [
+              ...mergedPlacements,
+              ...offsetPlacements(snapshot.placements),
+            ];
+            // perSticker for this snapshot = committed totals from prior
+            // tiles + this tile's in-flight numbers.
+            const livePerSticker: Record<
+              string,
+              { requested: number; placed: number }
+            > = { ...mergedPerSticker };
+            for (const [id, ps] of Object.entries(snapshot.perSticker)) {
+              const prev = livePerSticker[id] ?? { requested: 0, placed: 0 };
+              livePerSticker[id] = {
+                requested: prev.requested + ps.requested,
+                placed: prev.placed + ps.placed,
+              };
+            }
+            setPack((p) => ({
+              ...p,
+              result: {
+                placements: merged,
+                requested: totalRequested,
+                placed: placedSoFar + snapshot.placed,
+                perSticker: livePerSticker,
+                bboxCoverage: snapshot.bboxCoverage,
+                extraFits: {},
+              },
+              progressPlaced: placedSoFar + snapshot.placed,
+              progressRequested: totalRequested,
+            }));
+          },
+          onDone: (result) => {
+            // Commit this tile's placements + per-sticker counts into
+            // the running merge so subsequent tiles' partials/dones can
+            // see them.
+            mergedPlacements.push(...offsetPlacements(result.placements));
+            placedSoFar += result.placed;
+            for (const [id, ps] of Object.entries(result.perSticker)) {
+              const prev = mergedPerSticker[id] ?? {
+                requested: 0,
+                placed: 0,
+              };
+              mergedPerSticker[id] = {
+                requested: prev.requested + ps.requested,
+                placed: prev.placed + ps.placed,
+              };
+            }
             setPack((p) => {
-              // Defensive: if something already stashed bitmaps (retry?),
-              // free them first.
-              disposeVariantBitmaps(p.variantBitmaps);
-              return { ...p, variantBitmaps: msg.variantBitmaps };
-            });
-          } else if (msg.type === "partial") {
-            // Live snapshot — render the improved layout immediately.
-            // `extraFits` isn't known yet, so stub it as {}; the
-            // SuggestionDrawer is gated on `!pack.loading` so this
-            // empty map won't render a stale suggestion either.
-            setPack((p) => ({
-              ...p,
-              result: { ...msg.snapshot, extraFits: {} },
-              progressPlaced: msg.snapshot.placed,
-              progressRequested: msg.snapshot.requested,
-            }));
-          } else if (msg.type === "done") {
-            // `done` carries the final layout but `extraFits` is left
-            // empty by the worker — the probe runs afterwards and
-            // arrives in a follow-up `extraFits` message. Keep the
-            // handler registered so we catch it.
-            setPack((p) => ({
-              ...p,
-              loading: false,
-              progressPlaced: msg.result.placed,
-              progressRequested: msg.result.requested,
-              result: msg.result,
-              error: null,
-            }));
-          } else if (msg.type === "extraFits") {
-            // Follow-up after `done`. Merge the numbers into whatever
-            // result is currently on the pack state — guarded so a
-            // superseded request can't clobber a newer result.
-            setPack((p) => {
-              if (!p.result) return p;
               return {
                 ...p,
-                result: { ...p.result, extraFits: msg.extraFits },
+                result: {
+                  placements: [...mergedPlacements],
+                  requested: totalRequested,
+                  placed: placedSoFar,
+                  perSticker: { ...mergedPerSticker },
+                  bboxCoverage: result.bboxCoverage,
+                  extraFits: {},
+                },
               };
             });
-            worker.removeEventListener("message", handler);
-          } else if (msg.type === "error") {
-            setPack((p) => ({ ...p, loading: false, error: msg.message }));
-            worker.removeEventListener("message", handler);
-          }
+          },
+          onExtraFits: (extraFits) => {
+            for (const [id, n] of Object.entries(extraFits)) {
+              mergedExtraFits[id] = (mergedExtraFits[id] ?? 0) + n;
+            }
+          },
+          onError: (message) => {
+            setPack((p) => ({ ...p, loading: false, error: message }));
+          },
+        });
+
+        if (reqId !== reqIdRef.current) return;
+      }
+
+      if (reqId !== reqIdRef.current) return;
+      // All tiles done — finalize loading state and surface extraFits.
+      setPack((p) => {
+        if (!p.result) {
+          return {
+            ...p,
+            loading: false,
+            progressPlaced: placedSoFar,
+            progressRequested: totalRequested,
+          };
+        }
+        return {
+          ...p,
+          loading: false,
+          progressPlaced: placedSoFar,
+          progressRequested: totalRequested,
+          result: { ...p.result, extraFits: { ...mergedExtraFits } },
         };
-        worker.addEventListener("message", handler);
-        worker.postMessage({ type: "pack", request: req }, transfers);
       });
     },
-    [disposeVariantBitmaps],
+    [disposeVariantBitmaps, dispatchSinglePack],
   );
 
   // Pack runs are expensive — up to a few seconds at Exact quality with
@@ -446,6 +621,7 @@ export default function App() {
         stride,
         rotationStep,
         dpi,
+        packMode,
       );
     }, 1000);
     return () => clearTimeout(t);
@@ -460,6 +636,7 @@ export default function App() {
     stride,
     rotationStep,
     dpi,
+    packMode,
     runPack,
   ]);
 
@@ -494,6 +671,7 @@ export default function App() {
         canvasHeightPx={pack.canvasHeightPx}
         dpi={dpi}
         alphaThreshold={alpha}
+        packMode={packMode}
         onBack={() => setView("pack")}
       />
     );
@@ -513,6 +691,7 @@ export default function App() {
         alpha={alpha}
         stride={stride}
         rotationStep={rotationStep}
+        packMode={packMode}
         onDpi={setDpi}
         onCanvasWcm={setCanvasWcm}
         onCanvasHcm={setCanvasHcm}
@@ -522,6 +701,7 @@ export default function App() {
         onAlpha={setAlpha}
         onStride={setStride}
         onRotationStep={setRotationStep}
+        onPackMode={setPackMode}
         onOpenGallery={() => setGalleryOpen(true)}
         onFilesSelected={addFiles}
         importing={importing}
@@ -576,6 +756,7 @@ interface SidebarProps {
   alpha: number;
   stride: number;
   rotationStep: number;
+  packMode: "tiles" | "single";
   onDpi: (n: number) => void;
   onCanvasWcm: (n: number) => void;
   onCanvasHcm: (n: number) => void;
@@ -585,6 +766,7 @@ interface SidebarProps {
   onAlpha: (n: number) => void;
   onStride: (n: number) => void;
   onRotationStep: (n: number) => void;
+  onPackMode: (m: "tiles" | "single") => void;
   onOpenGallery: () => void;
   onFilesSelected: (files: FileList | File[]) => void;
   importing: boolean;
@@ -676,6 +858,18 @@ function Sidebar(props: SidebarProps) {
                 props.onCanvasHcm(CRICUT_PTC_CM.h);
               }}
               label="Cricut"
+            />
+          </div>
+          <div className="flex gap-2" role="group" aria-label="Pack mode">
+            <PresetButton
+              active={props.packMode === "tiles"}
+              onClick={() => props.onPackMode("tiles")}
+              label="Cricut tiles"
+            />
+            <PresetButton
+              active={props.packMode === "single"}
+              onClick={() => props.onPackMode("single")}
+              label="Single canvas"
             />
           </div>
           <div>
