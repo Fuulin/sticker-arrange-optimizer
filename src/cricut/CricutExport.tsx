@@ -22,6 +22,13 @@ export interface CricutExportProps {
   /** Alpha-channel threshold (0-255) inherited from the main page so cut
    * paths trace the same opaque region the packer used for collisions. */
   alphaThreshold: number;
+  /**
+   * "tiles" packs each tile separately on the main page so nothing
+   * overhangs by construction; "single" is the legacy single-canvas
+   * pack and may emit straddlers, in which case the export pipeline
+   * runs a post-pack auto-nudge.
+   */
+  packMode: "tiles" | "single";
   onBack: () => void;
 }
 
@@ -185,6 +192,7 @@ export function CricutExport(props: CricutExportProps) {
 
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [lastDropped, setLastDropped] = useState(0);
   const onDownload = async () => {
     setDownloading(true);
     setDownloadError(null);
@@ -198,7 +206,9 @@ export function CricutExport(props: CricutExportProps) {
         bleedMm,
         alphaThreshold: props.alphaThreshold,
         skipEmptyTiles,
+        autoNudgeOverhangs: props.packMode === "single",
       });
+      setLastDropped(result.droppedCount);
       const wcm = ((props.canvasWidthPx * 2.54) / props.dpi).toFixed(1);
       const hcm = ((props.canvasHeightPx * 2.54) / props.dpi).toFixed(1);
       const base = `cricut-${wcm}x${hcm}cm`;
@@ -235,6 +245,11 @@ export function CricutExport(props: CricutExportProps) {
           {overhanging.size > 0 ? (
             <span className="ml-2 text-amber-400">
               · {overhanging.size} over boundary
+            </span>
+          ) : null}
+          {lastDropped > 0 ? (
+            <span className="ml-2 rounded bg-red-500/20 px-1.5 py-0.5 text-red-300">
+              · nudge dropped {lastDropped}
             </span>
           ) : null}
         </div>

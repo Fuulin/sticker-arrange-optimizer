@@ -4,6 +4,7 @@ import { CRICUT_PTC_IN, INCH_PER_MM, mmToPx } from "../lib/units";
 import { bitmapToContours, type Polyline } from "./contour";
 import {
   assignPlacementsToTiles,
+  placementFitsInTile,
   tileCanvas,
   type Tile,
 } from "./tiles";
@@ -22,6 +23,13 @@ export interface BuildExportInput {
   /** Tile size in canvas pixels. Default = 9.25" × 6.75" at `dpi`. */
   tileWidthPx?: number;
   tileHeightPx?: number;
+  /**
+   * When true, any placement that overhangs its assigned tile is shoved
+   * to a free spot inside the same tile (or dropped if none exists). Use
+   * this for single-canvas pack outputs that may straddle tile borders;
+   * tile-aware pack outputs already fit by construction.
+   */
+  autoNudgeOverhangs?: boolean;
 }
 
 function simplifyTolerancePx(dpi: number): number {
@@ -154,6 +162,107 @@ export interface BuildExportResult {
   /** Each entry: filename (no path) + SVG content. */
   files: Array<{ name: string; svg: string }>;
   tiles: Tile[];
+  /**
+   * Number of placements that the auto-nudge step couldn't fit anywhere
+   * inside their assigned tile and therefore dropped from the export.
+   * Always 0 when `autoNudgeOverhangs` is false.
+   */
+  droppedCount: number;
+}
+
+/**
+ * Bounding-box collision check. Treats `aw`/`ah` etc. as exclusive upper
+ * bounds, matching how `placementFitsInTile` checks containment.
+ */
+function rectsOverlap(
+  ax: number,
+  ay: number,
+  aw: number,
+  ah: number,
+  bx: number,
+  by: number,
+  bw: number,
+  bh: number,
+): boolean {
+  return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+}
+
+/**
+ * For each tile, take any placement assigned to it that overhangs the
+ * tile bounds and try to relocate it to a free interior position. If no
+ * collision-free spot is found inside the tile, drop it. Returns the
+ * cleaned (possibly reordered) placement list and the number of drops.
+ *
+ * Uses simple AABB collision against placements ALREADY accepted in the
+ * same tile — fast enough that a coarse 4 px scan over a 9.25"×6.75"
+ * tile completes in a handful of milliseconds.
+ */
+function nudgeOverhangsToTileInterior(
+  placements: Placement[],
+  tiles: Tile[],
+): { placements: Placement[]; droppedCount: number } {
+  const initial = assignPlacementsToTiles(placements, tiles);
+  const cleaned: Placement[] = [];
+  let dropped = 0;
+  const STEP = 4;
+
+  for (let i = 0; i < tiles.length; i++) {
+    const tile = tiles[i];
+    const tilePlacements = initial.get(i) ?? [];
+    // Process fitters first so they "anchor" the tile; overhangers then
+    // search around them. This matches the spec: nudge overhangers to
+    // free spots that don't collide with already-placed stickers.
+    const fitters: Placement[] = [];
+    const overhang: Placement[] = [];
+    for (const p of tilePlacements) {
+      if (placementFitsInTile(p, tile)) fitters.push(p);
+      else overhang.push(p);
+    }
+
+    const accepted: Placement[] = [...fitters];
+    for (const p of overhang) {
+      const maxX = tile.x + tile.width - p.width;
+      const maxY = tile.y + tile.height - p.height;
+      let placedAt: { x: number; y: number } | null = null;
+      if (maxX >= tile.x && maxY >= tile.y) {
+        outer: for (let y = tile.y; y <= maxY; y += STEP) {
+          for (let x = tile.x; x <= maxX; x += STEP) {
+            let collides = false;
+            for (const a of accepted) {
+              if (
+                rectsOverlap(
+                  x,
+                  y,
+                  p.width,
+                  p.height,
+                  a.x,
+                  a.y,
+                  a.width,
+                  a.height,
+                )
+              ) {
+                collides = true;
+                break;
+              }
+            }
+            if (!collides) {
+              placedAt = { x, y };
+              break outer;
+            }
+          }
+        }
+      }
+      if (placedAt) {
+        accepted.push({ ...p, x: placedAt.x, y: placedAt.y });
+      } else {
+        dropped++;
+      }
+    }
+
+    cleaned.push(...accepted);
+  }
+
+  return { placements: cleaned, droppedCount: dropped };
 }
 
 export async function buildCricutExport(
@@ -169,7 +278,15 @@ export async function buildCricutExport(
     tileWpx,
     tileHpx,
   );
-  const assign = assignPlacementsToTiles(input.placements, allTiles);
+
+  let workingPlacements = input.placements;
+  let droppedCount = 0;
+  if (input.autoNudgeOverhangs) {
+    const nudged = nudgeOverhangsToTileInterior(workingPlacements, allTiles);
+    workingPlacements = nudged.placements;
+    droppedCount = nudged.droppedCount;
+  }
+  const assign = assignPlacementsToTiles(workingPlacements, allTiles);
 
   // Pick the tiles that will actually appear in the export. When
   // `skipEmptyTiles` is on, drop any tile whose centroid-assigned list
@@ -204,7 +321,7 @@ export async function buildCricutExport(
       total === 1 ? "tile.svg" : `tile-${i + 1}-of-${total}.svg`;
     files.push({ name, svg });
   }
-  return { files, tiles: exported.map((e) => e.tile) };
+  return { files, tiles: exported.map((e) => e.tile), droppedCount };
 }
 
 /** Browser download helper. */
