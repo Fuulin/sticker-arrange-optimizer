@@ -307,6 +307,14 @@ export default function App() {
           if (settled) return;
           settled = true;
           worker.removeEventListener("message", handler);
+          // Clear the ref so the next dispatchSinglePack call does NOT
+          // terminate this finished worker — terminating an already-
+          // settled worker invalidates the ImageBitmaps it transferred
+          // to the main thread (Chrome ties the bitmap's backing
+          // storage to the source worker context). In tile mode this
+          // would kill tile N's variant bitmaps the moment tile N+1
+          // started.
+          if (workerRef.current === worker) workerRef.current = null;
           resolve();
         };
         const handler = (e: MessageEvent<WorkerOutMessage>) => {
@@ -468,9 +476,20 @@ export default function App() {
           return;
         }
 
+        // Clip the tile rect to the user's canvas bounds. Without this,
+        // an A4 canvas (2480 px wide) packed into 2775 px PTC tiles
+        // would let stickers land in [2480, 2775] — off-canvas, invisible
+        // in the preview, and printed on the blank right edge of the
+        // Cricut sheet.
+        const effW = Math.min(tile.width, canvasWPx - tile.x);
+        const effH = Math.min(tile.height, canvasHPx - tile.y);
+        if (effW <= 0 || effH <= 0) {
+          clones.forEach((c) => c.bitmap.close());
+          continue;
+        }
         const req: SerializablePackRequest = {
-          canvasWidth: tile.width,
-          canvasHeight: tile.height,
+          canvasWidth: effW,
+          canvasHeight: effH,
           margin: marginPxArg,
           padding: paddingPxArg,
           stride: strideArg,
