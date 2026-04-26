@@ -83,6 +83,59 @@ function extractMask(
 }
 
 /**
+ * Downsample a binary mask by integer factor `stride` using OR
+ * aggregation: a destination cell is set iff ANY of the (up to)
+ * stride×stride source pixels covering it is set. This preserves thin
+ * features (e.g. a 2px anti-aliased outline) that an alpha-blend
+ * downscale-then-threshold would erase, making the resulting collision
+ * mask independent of the canvas smoothing implementation.
+ */
+function downsampleMaskOr(src: Mask, stride: number): Mask {
+  if (stride <= 1) return src;
+  const dW = Math.max(1, Math.ceil(src.w / stride));
+  const dH = Math.max(1, Math.ceil(src.h / stride));
+  const dst = emptyMask(dW, dH);
+  const sData = src.data;
+  const sRW = src.rowWords;
+  const dData = dst.data;
+  const dRW = dst.rowWords;
+  const sH = src.h;
+  const sW = src.w;
+  for (let dy = 0; dy < dH; dy++) {
+    const sy0 = dy * stride;
+    const sy1 = Math.min(sH, sy0 + stride);
+    const dBase = dy * dRW;
+    for (let sy = sy0; sy < sy1; sy++) {
+      const sBase = sy * sRW;
+      for (let dx = 0; dx < dW; dx++) {
+        // Probe whether any of [sx0, sx1) is set in this source row.
+        const sx0 = dx * stride;
+        const sx1 = Math.min(sW, sx0 + stride);
+        // Word-walk over [sx0, sx1).
+        const w0 = sx0 >>> 5;
+        const w1 = (sx1 - 1) >>> 5;
+        const loBit = sx0 & 31;
+        const hiBit = (sx1 - 1) & 31;
+        const lowMask =
+          (loBit === 0 ? 0xffffffff : (0xffffffff << loBit)) >>> 0;
+        const highMask =
+          hiBit === 31 ? 0xffffffff : ((1 << (hiBit + 1)) - 1) >>> 0;
+        let any: number;
+        if (w0 === w1) {
+          any = sData[sBase + w0] & lowMask & highMask;
+        } else {
+          any = sData[sBase + w0] & lowMask;
+          for (let wi = w0 + 1; wi < w1; wi++) any |= sData[sBase + wi];
+          any |= sData[sBase + w1] & highMask;
+        }
+        if (any !== 0) dData[dBase + (dx >>> 5)] |= 1 << (dx & 31);
+      }
+    }
+  }
+  return dst;
+}
+
+/**
  * Chebyshev dilation by r cells, padded by r on every side. Two passes
  * (horizontal then vertical), both bitwise on the packed row words. The
  * horizontal pass ORs the source row into the destination at each of the
@@ -361,20 +414,23 @@ async function buildVariant(
   const outH = Math.max(1, Math.ceil(srcW * sin + srcH * cos));
 
   const full = new OffscreenCanvas(outW, outH);
-  const fctx = full.getContext("2d");
+  const fctx = full.getContext("2d", { willReadFrequently: true });
   if (!fctx) return null;
   fctx.translate(outW / 2, outH / 2);
   fctx.rotate(rad);
   fctx.drawImage(bitmap, -srcW / 2, -srcH / 2);
 
-  const gW = Math.max(1, Math.ceil(outW / stride));
-  const gH = Math.max(1, Math.ceil(outH / stride));
-  const gc = new OffscreenCanvas(gW, gH);
-  const gctx = gc.getContext("2d", { willReadFrequently: true });
-  if (!gctx) return null;
-  gctx.imageSmoothingEnabled = true;
-  gctx.drawImage(full, 0, 0, gW, gH);
-  const fullMask = extractMask(gctx, gW, gH, alphaThreshold);
+  // Build the collision mask at *full* canvas resolution and then OR-
+  // downsample to the pack grid. Sampling smoothed pixels at grid
+  // resolution erases thin features (e.g. a 2 px anti-aliased outline)
+  // because the smoothed alpha falls below the user's threshold, and the
+  // packer then lets neighbours sit on top of those outlines. With OR
+  // downsampling, a grid cell is occupied iff *any* full-res pixel under
+  // it passes the alpha threshold, so thin features survive any stride.
+  const fullResMask = extractMask(fctx, outW, outH, alphaThreshold);
+  const fullMask = downsampleMaskOr(fullResMask, stride);
+  const gW = fullMask.w;
+  const gH = fullMask.h;
 
   // Opaque-bbox scan on the bitpacked mask: walk words, skip empty ones, and
   // use clz32/ctz-equivalent bit math to get first/last set column cheaply.
